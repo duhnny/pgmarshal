@@ -1,0 +1,1369 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"slices"
+	"strings"
+
+	"github.com/danielbetoret/organization/services/api/src/reflection"
+	"github.com/danielbetoret/organization/services/api/src/utils"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type DBWrapper struct {
+	context *context.Context
+	conn    *pgxpool.Pool
+}
+
+func (db *DBWrapper) GetTableConfig(table Table) (TableConfig, error) {
+	columnsQueryResults, err := db.conn.Query(*db.context, `
+		SELECT
+			table_schema,
+			table_name,
+			column_name,
+			ordinal_position,
+			is_nullable,
+			data_type
+		FROM information_schema.columns
+		WHERE
+			table_schema = $1
+			AND
+			table_name = $2
+	`, table.Schema, table.Name)
+	if err != nil {
+		panic(err)
+	}
+    defer columnsQueryResults.Close()
+
+	var columnsConfig = make([]ColumnConfig, 0)
+	for columnsQueryResults.Next() {
+		var table_schema string
+		var table_name string
+		var columnConfig ColumnConfig
+		var nullable string
+		err = columnsQueryResults.Scan(
+			&table_schema,
+			&table_name,
+			&columnConfig.Name,
+			&columnConfig.Position,
+			&nullable,
+			&columnConfig.Type,
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		switch nullable {
+		case "YES":
+			columnConfig.Nullable = true
+		case "NO":
+			columnConfig.Nullable = false
+		}
+
+		columnsConfig = append(columnsConfig, columnConfig)
+	}
+
+	constraintsQueryResults, err := db.conn.Query(*db.context, `
+		SELECT
+			ccu.column_name,
+			tc.constraint_type
+		FROM
+			information_schema.table_constraints AS tc
+		JOIN
+			information_schema.constraint_column_usage AS ccu
+			ON ccu.constraint_name = tc.constraint_name
+		WHERE
+			tc.table_schema = $1
+			AND
+			tc.table_name = $2
+			AND
+			tc.constraint_type != 'FOREIGN KEY'
+	`, table.Schema, table.Name)
+	if err != nil {
+		panic(err)
+	}
+	defer constraintsQueryResults.Close()
+
+	for constraintsQueryResults.Next() {
+		var column_name string
+		var constraint_type string
+		constraintsQueryResults.Scan(&column_name, &constraint_type)
+
+		index := slices.IndexFunc(columnsConfig, func(columnConfig ColumnConfig) bool {
+			return columnConfig.Name == column_name
+		})
+		if index == -1 {
+			return TableConfig{}, fmt.Errorf("constraints: column %s not found in table %s\nTableConfig: %v", column_name, table.Name, columnsConfig)
+		}
+
+		switch constraint_type {
+		case "PRIMARY KEY":
+			columnsConfig[index].PrimaryKey = true
+			columnsConfig[index].Unique = true
+		case "UNIQUE":
+			columnsConfig[index].Unique = true
+		case "FOREIGN KEY":
+		}
+	}
+
+	// query from https://stackoverflow.com/a/1152321
+	foreignKeyQueryResults, err := db.conn.Query(*db.context, `
+		SELECT
+			kcu.column_name,
+			ccu.table_schema AS foreign_table_schema,
+			ccu.table_name AS foreign_table_name,
+			ccu.column_name AS foreign_column_name 
+		FROM information_schema.table_constraints AS tc 
+		JOIN information_schema.key_column_usage AS kcu
+			ON tc.constraint_name = kcu.constraint_name
+			AND tc.table_schema = kcu.table_schema
+		JOIN information_schema.constraint_column_usage AS ccu
+			ON ccu.constraint_name = tc.constraint_name
+		WHERE tc.constraint_type = 'FOREIGN KEY'
+			AND tc.table_schema = $1
+			AND tc.table_name = $2
+	`, table.Schema, table.Name)
+	if err != nil {
+		panic(err)
+	}
+	defer foreignKeyQueryResults.Close()
+
+	for foreignKeyQueryResults.Next() {
+		var column_name string
+		var foreign_table_schema string
+		var foreign_table_name string
+		var foreign_column_name string
+		err = foreignKeyQueryResults.Scan(
+			&column_name,
+			&foreign_table_schema,
+			&foreign_table_name,
+			&foreign_column_name,
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		index := slices.IndexFunc(columnsConfig, func(columnConfig ColumnConfig) bool {
+			return columnConfig.Name == column_name
+		})
+		if index == -1 {
+			return TableConfig{}, fmt.Errorf("constraints: column not found")
+		}
+
+		columnsConfig[index].ForeignKey.IsForeignKey = true
+		columnsConfig[index].ForeignKey.ReferencedTable = Table{Schema: foreign_table_schema, Name: foreign_table_name}
+		columnsConfig[index].ForeignKey.ReferencedColumn = foreign_column_name
+	}
+
+	// sort columnsConfig slice by the order of the columns
+	slices.SortStableFunc(columnsConfig, func(a ColumnConfig, b ColumnConfig) int {
+		switch {
+		case a.Position < b.Position:
+			return -1
+		case a.Position > b.Position:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	return TableConfig{
+		Table:   table,
+		Columns: columnsConfig,
+	}, nil
+}
+
+// crud methods
+type insert struct {
+	columns []Column
+	sql string
+	args []any
+}
+
+func (db *DBWrapper) Create(values []any, table Table, opts QueryOpts) (int, error) {
+	// require at least one value
+	if len(values) == 0 {
+		if opts.AllowNone {
+			return 0, nil
+		}
+		return 0, NoValuesErr
+	}
+
+	t := reflect.TypeOf(values[0])
+
+	// first of all, gather necessary data
+	structMap := structTreeNode{}
+
+	err := createStructMap(
+		db,
+		table,
+		Column{},
+		t,
+		reflection.NewPath(),
+		&structMap,
+		opts,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("db: found the following error while gathering data for the query: %w", err)
+	}
+
+	columns := make([]Column, 0)
+	columnMap := make(map[Column]*reflection.Path)
+	joins := make([]join, 0)
+
+	err = structMap.gatherQueryData(reflection.NewPath(""), &columns, &columnMap, &joins)
+	if err != nil {
+		return 0, err
+	}
+
+	insertTables := append([]Table{table}, utils.Map(joins, func(j join) Table {
+		return j.joined.Table
+	})...)
+	
+	for _, join := range joins {
+		if slices.Contains(columns, join.joined) && !slices.Contains(columns, join.original) {
+			columns = append(columns, join.original)
+			columnMap[join.original] = columnMap[join.joined]
+		} else if slices.Contains(columns, join.original) && !slices.Contains(columns, join.joined) {
+			columns = append(columns, join.joined)
+			columnMap[join.joined] = columnMap[join.original]
+		}
+	}
+
+	// begin transaction
+	tx, err := db.conn.Begin(*db.context)
+	if err != nil {
+		return 0, ConnectionErr
+	}
+
+	// create sql for each table
+	// we run it in the reverse order of the joins, because
+	sql := make([]insert, 0)
+	for i := len(insertTables)-1; i >= 0; i-- {
+		tb := insertTables[i]
+
+		ins := insert{}
+		for _, c := range columns {
+			if c.Table == tb {
+				ins.columns = append(ins.columns, c)
+			}
+		}
+
+		ins.sql = fmt.Sprintf(
+			"INSERT INTO %s (%s)\nVALUES ",
+			pgx.Identifier([]string{tb.Schema, tb.Name}).Sanitize(),
+			strings.Join(utils.Map(ins.columns, func(c Column) string {
+				return pgx.Identifier([]string{
+					c.Name,
+				}).Sanitize()
+			}), ","),
+		)
+
+		sql = append(sql, ins)
+	}
+
+	for j := range sql {
+		i := 1
+		valuesSql := make([]string, 0)
+		for _, value := range values {
+			valuePlaceholders := make([]string, 0)
+			for _, column := range sql[j].columns {
+				valuePlaceholders = append(valuePlaceholders, fmt.Sprintf("$%d", i))
+
+				fieldValue, err := reflection.GetField(
+					reflect.ValueOf(value),
+					*columnMap[column],
+					false,
+				)
+				if err != nil {
+					return 0, err
+				}
+				
+				sql[j].args = append(sql[j].args, fieldValue.Interface())
+
+				i++
+			}
+			valuesSql = append(valuesSql, "(" + strings.Join(valuePlaceholders, ",") + ")")
+		}
+
+
+		sql[j].sql += strings.Join(valuesSql, ",\n") + ";\n"
+	}
+	
+	rowsAffected := 0
+	for _, ins := range sql {
+		ctag, err := tx.Exec(*db.context, ins.sql, ins.args...)
+		if err != nil {
+			tx.Rollback(*db.context)
+			return 0, err
+		}
+
+		rowsAffected += int(ctag.RowsAffected())
+	}
+
+	err = tx.Commit(*db.context)
+	if err != nil {
+		tx.Rollback(*db.context)
+		return 0, err
+	}
+	
+	return rowsAffected, nil
+}
+
+func (db *DBWrapper) CreateRow(value any, table Table, opts QueryOpts) (int, error) {
+	return db.Create([]any{value}, table, opts)
+}
+
+func (db *DBWrapper) Query(values []any, table Table, opts QueryOpts) (int, error) {
+    // if values slice is empty
+    if len(values) == 0 {
+        if opts.AllowNone {
+            return 0, nil
+        }
+        return 0, &RowNotFoundError{}
+    }
+
+    // get type
+    rv := reflect.ValueOf(values[0])
+    t := rv.Type()
+
+    // get all data necessary to make the query in one go
+	structMap := structTreeNode{}
+
+    err := createStructMap(
+        db,
+        table,
+		Column{},
+        t,
+        reflection.NewPath(),
+		&structMap,
+        opts,
+    )
+    if err != nil {
+        return 0, err
+    }
+
+	columns := make([]Column, 0)
+	columnMap := make(map[Column]*reflection.Path)
+	joins := make([]join, 0)
+	err = structMap.gatherQueryData(
+		reflection.NewPath(""),
+		&columns,
+		&columnMap,
+		&joins,
+	)
+	if err != nil {
+		panic(err)
+	}
+    if len(columns) == 0 {
+        return 0, NoMatchingColumnErr
+    }
+
+    // build sql
+    selectSql := "SELECT " + strings.Join(
+        utils.Map(
+            columns,
+            func(c Column) string {
+                return pgx.Identifier([]string{
+                    c.Table.Schema,
+                    c.Table.Name,
+                    c.Name,
+                }).Sanitize()
+            },
+        ),
+        ", ",
+    )
+
+    fromSql := fmt.Sprintf(
+        "FROM %s %s",
+        pgx.Identifier([]string{table.Schema, table.Name}).Sanitize(),
+        strings.Join(
+            utils.IndexMap(
+                joins,
+                func(i int, j join) string {
+                    return fmt.Sprintf(
+                        "LEFT JOIN %s ON %s = %s",
+                        pgx.Identifier([]string{
+                            j.joined.Table.Schema,
+                            j.joined.Table.Name,
+                        }).Sanitize(),
+                        pgx.Identifier([]string{
+                            j.original.Table.Schema,
+                            j.original.Table.Name,
+                            j.original.Name,
+                        }).Sanitize(),
+                        pgx.Identifier([]string{
+                            j.joined.Table.Schema,
+                            j.joined.Table.Name,
+                            j.joined.Name,
+                        }).Sanitize(),
+                    )
+                },
+            ),
+            " ",
+        ),
+    )
+
+    whereSql := ""
+    whereArgs := make([]any, 0)
+    if opts.Filters != nil {
+        whereSql = fmt.Sprintf("WHERE %s", opts.Filters.Sql())
+        whereArgs = opts.Filters.Args()
+    }
+
+    orderBySql := ""
+    if opts.OrderBy != nil {
+		order := ""
+        if opts.OrderBy.Desc {
+			order = "DESC"
+        } else {
+			order = "ASC"
+        }
+        orderBySql = fmt.Sprintf(
+			"ORDER BY %s %s",
+			pgx.Identifier([]string{
+            	opts.OrderBy.Column.Table.Schema,
+            	opts.OrderBy.Column.Table.Name,
+            	opts.OrderBy.Column.Name,
+        	}).Sanitize(),
+			order,
+		)
+    }
+
+    limitSql := ""
+    limitArgs := make([]any, 0)
+    if opts.Limit != 0 {
+        limitSql = "LIMIT $1"
+        limitArgs = append(limitArgs, opts.Limit)
+    }
+
+    finalSql, finalArgs := JoinSql(
+        []string{
+            selectSql,
+            fromSql,
+            whereSql,
+            orderBySql,
+            limitSql,
+        },
+        [][]any{
+            {},
+            {},
+            whereArgs,
+			{},
+            limitArgs,
+        },
+    )
+
+    finalSql += ";"
+
+    // actually query db
+    rows, err := db.conn.Query(*db.context, finalSql, finalArgs...)
+    if err != nil {
+		return 0, fmt.Errorf("db: could not send query: %w", err)
+    }
+
+    i := 0
+    for rows.Next() && i < len(values) {
+        addres := make([]any, 0)
+		valueMap := make(map[string]reflect.Value)
+
+        for _, column := range columns {
+            valueType, err := reflection.GetFieldType(reflect.ValueOf(values[i]).Type(), *columnMap[column])
+            if err != nil {
+                panic(err)
+            }
+			valueMap[(columnMap[column]).ToString()] = reflect.New(reflect.PointerTo(valueType))
+            addres = append(addres, valueMap[columnMap[column].ToString()].Interface())
+        }
+
+        err = rows.Scan(addres...)
+        if err != nil {
+            return 0, err
+        }
+
+		for _, column := range columns {
+			// if is is nil, we find out if the value itself is a pointer or
+			// if the parent is a pointer (in case of a foreign key)
+			if valueMap[columnMap[column].ToString()].Elem().IsNil() {
+				path := slices.Clone(*columnMap[column])
+				l := len(path)
+
+				// check first if the value is a foreign key
+				path = slices.Delete(path, l-1, l)
+				l = l-1
+				path[l-1] = strings.ReplaceAll(path.Get(-1), "*", "")
+
+				parent, err := structMap.Get(path)
+				if err != nil {
+					panic(err)
+				}
+
+				parentValue, err := reflection.GetField(reflect.ValueOf(values[i]), path, false)
+				if err != nil {
+					panic(err)
+				}
+
+				child, err := structMap.Get(*columnMap[column])
+				if err != nil {
+					panic(err)
+				}
+
+				if !reflect.ValueOf(parent.joinedColumn).IsZero() {
+					if parent.joinedColumn != child.column {
+						// in case the column is not the primary key
+						continue
+					}
+
+					// if it is, check if parent is nullable
+					if parentValue.Kind() != reflect.Pointer {
+						return 0, &InvalidValueError{
+							Value: parentValue,
+							Message: fmt.Sprintf(
+								"db: value at path %s cannot be set to <nil>",
+								strings.Join(path, "."),
+							),
+						}
+					}
+
+					// if it is nullable, set to nil
+					if !parentValue.CanSet() {
+						return 0, &InvalidValueError{
+							Value: parentValue,
+							Message: fmt.Sprintf("Cannot set value in struct path %s", path),
+						}
+					}
+					parentValue.Set(reflect.Zero(parentValue.Type()))
+					continue
+				}
+
+				// this only happens if there is no join, but the column is a foreign key
+				if parent.column == child.column {
+					// in this case, check if parent is nullable
+					if parentValue.Kind() != reflect.Pointer {
+						return 0, &InvalidValueError{
+							Value: parentValue,
+							Message: fmt.Sprintf(
+								"db: value at path %s cannot be set to <nil>",
+								strings.Join(path, "."),
+							),
+						}
+					}
+
+					// if it is nullable, set to nil
+					if !parentValue.CanSet() {
+						return 0, &InvalidValueError{
+							Value: parentValue,
+							Message: fmt.Sprintf("Cannot set value in struct path %s", path),
+						}
+					}
+					parentValue.SetZero()
+					continue
+				}
+
+				// if it is not a foreign key, we see whether the value itself is nullable
+				path = slices.Clone(*columnMap[column])
+				l = len(path)
+				path[l-1] = strings.ReplaceAll(path.Get(-1), "*", "")
+
+				wrappedValue, err := reflection.GetField(reflect.ValueOf(values[i]), path, false)
+				if err != nil {
+					panic(err)
+				}
+
+				// if it is not a pointer, return an error
+				if wrappedValue.Kind() != reflect.Pointer {
+					return 0, &InvalidValueError{
+						Value: wrappedValue,
+						Message: fmt.Sprintf(
+							"db: value at path %s cannot be set to <nil>",
+							strings.Join(path, "."),
+						),
+					}
+				} 
+				
+				// otherwise, set it to <nil>
+				if !wrappedValue.CanSet() {
+					return 0, &InvalidValueError{
+						Value: parentValue,
+						Message: fmt.Sprintf("Cannot set value in struct path %s", path),
+					}
+				}
+				wrappedValue.SetZero()
+				continue
+			} else {
+				value, err := reflection.GetField(reflect.ValueOf(values[i]), *columnMap[column], true)
+				if err != nil {
+					panic(err)
+				}
+
+				if !value.CanSet() {
+					return 0, &InvalidValueError{
+						Value: value,
+						Message: fmt.Sprintf("Cannot set value in struct path %s", columnMap[column]),
+					}
+				}
+
+				value.Set(valueMap[columnMap[column].ToString()].Elem().Elem())
+			}
+		}
+
+        i++
+    }
+
+	if i == 0 && !opts.AllowNone {
+		return 0, &RowNotFoundError{}
+	}
+
+    return i, nil
+}
+
+func (db *DBWrapper) QueryRow(value any, table Table, opts QueryOpts) error {
+	_, err := db.Query([]any{value}, table, opts)
+	
+	return err
+}
+
+type join struct {
+	original Column
+	joined   Column
+}
+
+type structTreeNode struct {
+	ptrCount      int
+	path          string
+	table         Table
+	column        Column
+	joinedColumn  Column
+	children      []*structTreeNode
+}
+
+func (s *structTreeNode) Print() {
+	fmt.Println("ptrCount", s.ptrCount)
+	fmt.Println("path", s.path)
+	fmt.Println("table", s.table)
+	fmt.Println("column", s.column)
+	fmt.Println("joinedColumn", s.joinedColumn)
+	
+	fmt.Println("children: [")
+	for _, child := range s.children {
+		child.Print()
+	}
+	fmt.Println("]")
+}
+
+func (s *structTreeNode) Get(p reflection.Path) (*structTreeNode, error) {
+	if len(p) == 1 {
+		return s, nil
+	}
+
+	field := strings.ReplaceAll(p.Get(1), "*", "")
+	for _, child := range s.children {
+		if child.path == field {
+			return child.Get(append([]string{""}, p[2:]...))
+		}
+	}
+
+	return nil, &reflection.FieldNotFoundErr{
+		Field: field,
+	}
+}
+
+func (s *structTreeNode) gatherQueryData(
+	currentPath reflection.Path,
+	columns *[]Column,
+	columnMap *map[Column]*reflection.Path,
+	joins *[]join,
+) error {
+	if !reflection.IsNull(reflect.ValueOf(s.joinedColumn)) {
+		(*joins) = append((*joins), join{
+			original: s.column,
+			joined: s.joinedColumn,
+		})
+	}
+
+	p := slices.Clone(currentPath)
+	p[len(p)-1] = strings.Repeat("*", s.ptrCount) + p.Get(-1)
+
+	if len(s.children) == 0 {
+		if reflection.IsNull(reflect.ValueOf(s.column)) == true {
+			return &ColumnNotFoundError{}
+		}
+
+		(*columns) = append((*columns), s.column)
+		(*columnMap)[s.column] = &p
+
+		return nil
+	}
+
+	for _, child := range s.children {
+		newPath := slices.Clone(p)
+		newPath = append(newPath, child.path)
+
+		err := child.gatherQueryData(newPath, columns, columnMap, joins)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func createStructMap(
+    db *DBWrapper,
+    table Table,
+	column Column,
+    t reflect.Type,
+    structPath reflection.Path,
+	structMap *structTreeNode,
+    opts QueryOpts,
+) error {
+	switch t.Kind() {
+	case
+		reflect.Int,
+		reflect.Int8,
+		reflect.Int16,
+		reflect.Int32,
+		reflect.Int64,
+		reflect.Uint,
+		reflect.Uint8,
+		reflect.Uint16,
+		reflect.Uint32,
+		reflect.Uint64,
+		reflect.Float32,
+		reflect.Float64,
+		reflect.Bool,
+		reflect.String,
+		reflect.Map:
+
+		if len(opts.Fields) > 0 {
+			return &reflection.FieldNotFoundErr{
+				Field: strings.Join(opts.Fields[0], "."),
+				Value: t,
+				Message: fmt.Sprintf(
+					"value of type %v at path %s does not have field %s",
+					t,
+					strings.Join(structPath, "."),
+					strings.Join(opts.Fields[0], "."),
+				),
+			}
+		}
+
+		structMap.ptrCount = strings.Count(structPath.Get(-1), "*")
+		structMap.path = strings.ReplaceAll(structPath.Get(-1), "*", "")
+		structMap.column = column
+
+		return nil
+
+	case reflect.Struct:
+		// if it is time
+		if t == reflection.Time {
+			structMap.ptrCount = strings.Count(structPath.Get(-1), "*")
+			structMap.path = strings.ReplaceAll(structPath.Get(-1), "*", "")
+			structMap.column = column
+
+			return nil
+		}
+
+		if !opts.AllFields && len(opts.Fields) == 0 {
+			return &ConflictingOptsError{
+				Opts: []Opt{
+					{Name: "Fields", Value: opts.Fields},
+					{Name: "AllFields", Value: opts.AllFields},
+				},
+			}
+		}
+
+		structMap.table = table
+		structMap.column = column
+
+	case reflect.Slice:
+		if t.Elem().Kind() != reflect.Uint8 {
+			return &InvalidValueError{Value: t, Message: "fields should be either values, maps, structs or pointers to one of the three"}
+		}
+
+		if len(opts.Fields) > 0 {
+			return &reflection.FieldNotFoundErr{
+				Field: strings.Join(opts.Fields[0], "."),
+				Value: t,
+				Message: fmt.Sprintf(
+					"value of type %v at path %s does not have field %s",
+					t,
+					strings.Join(structPath, "."),
+					strings.Join(opts.Fields[0], "."),
+				),
+			}
+		}
+
+		structMap.ptrCount = strings.Count(structPath.Get(-1), "*")
+		structMap.path = strings.ReplaceAll(structPath.Get(-1), "*", "")
+		structMap.column = column
+
+		return nil
+
+	case reflect.Pointer:
+        path := slices.Clone(structPath)
+        n := len(path)
+        newPath := utils.IndexMap(path, func(i int, f string) string {
+            if i == n - 1 {
+                return "*" + f
+            }
+            return f
+        })
+
+		structMap.ptrCount += 1
+
+        return createStructMap(
+            db,
+            table,
+			column,
+            t.Elem(),
+            newPath,
+			structMap,
+            opts,
+        )
+
+	default:
+		return &InvalidValueError{Value: t, Message: "fields should be either values, maps, structs or pointers to one of the three"}
+	}
+
+    tc, err := db.GetTableConfig(table)
+    if err != nil {
+        return err
+    }
+
+	// now, if the structure is a map, we loop over columns of a table,
+	// and, if it is a struct, we loop over its fields
+	for i := 0; i < t.NumField(); i++ {
+		columnName := t.Field(i).Tag.Get("db")
+
+		if columnName == "" {
+			continue
+		}
+
+		// find column the field refers to
+		var col ColumnConfig
+
+		found := false
+		for j := 0; j < len(tc.Columns) && !found; j++ {
+			if tc.Columns[j].Name == columnName {
+				col = tc.Columns[j]
+				found = true
+			}
+		}
+
+		if !found {
+			continue
+		}
+
+        fieldType := t.Field(i).Type
+		fieldName := t.Field(i).Name
+
+        // initialize next struct path to keep track of where we are in the struct
+        newStructPath := slices.Clone(structPath)
+		newStructPath = append(newStructPath, fieldName)
+
+        // filter columns
+        if !opts.AllFields && !slices.ContainsFunc(opts.Fields, func(f reflection.Path) bool {
+			return reflection.IsSubpath(reflection.NewPath(fieldName), f, true)
+        }) {
+            continue
+        }
+
+		// prepare for recursion
+		newFields := make([]reflection.Path, 0)
+		for j := range opts.Fields {
+			oldField := slices.Clone(opts.Fields[j])
+			if len(oldField) > 2 && strings.ReplaceAll(oldField[1], "*", "") == fieldName {
+				newFields = append(newFields, reflection.NewPath(append([]string{""}, oldField[2:]...)...))
+			}
+		}
+		newOpts := opts
+		newOpts.Fields = newFields
+		if len(newOpts.Fields) == 0 && opts.Recursive {
+			newOpts.AllFields = true
+		}
+
+        // handle nested case
+        if col.IsForeignKey() && (fieldType.Kind() == reflect.Struct || reflection.PointsToKind(fieldType, reflect.Struct, true)) {
+            if opts.Recursive {
+				// this join must be made before recursion, otherwise we end up
+				// with the opposite order
+				newStructMap := structTreeNode{}
+
+                err = createStructMap(
+                    db,
+                    col.ForeignKey.ReferencedTable,
+					Column{Table: table, Name: col.Name},
+                    fieldType,
+                    newStructPath,
+					&newStructMap,
+                    newOpts,
+                )
+                if err != nil {
+                    return err
+                }
+
+				newStructMap.column = Column{
+					Table: table,
+					Name: col.Name,
+				}
+				newStructMap.joinedColumn = Column{
+					Table: col.ForeignKey.ReferencedTable,
+					Name: col.ForeignKey.ReferencedColumn,
+				}
+				newStructMap.path = strings.ReplaceAll(newStructPath.Get(-1), "*", "")
+				structMap.children = append(structMap.children, &newStructMap)
+
+            } else {
+				// get rid of pointers, in order to be able to use .NumField()
+				newOutterStructMap := structTreeNode{}
+				underlyingStruct := fieldType
+				if reflection.PointsToKind(underlyingStruct, reflect.Struct, true) {
+					for underlyingStruct.Kind() == reflect.Pointer {
+						underlyingStruct = underlyingStruct.Elem()
+
+						// add pointer indicator
+						newStructPath.AddPtr(len(newStructPath)-1)
+						newOutterStructMap.ptrCount += 1
+					}
+				}
+
+				// find field that maps to referenced column
+                j := 0
+                found = false
+                for j < underlyingStruct.NumField() && !found {
+                    if underlyingStruct.Field(j).Tag.Get("db") == col.ForeignKey.ReferencedColumn {
+                        found = true
+                    } else {
+                        j++
+                    }
+                }
+
+                if !found {
+                    return &InvalidValueError{
+                        Value: fieldType,
+                        Message: fmt.Sprintf(
+                            "nested struct does not have field for foreign key referenced column %s of table %s",
+                            col.ForeignKey.ReferencedColumn,
+                            col.ForeignKey.ReferencedTable.Schema + "." + col.ForeignKey.ReferencedTable.Name,
+                        ),
+                    }
+                }
+
+				if len(newOpts.Fields) > 1 ||
+					(len(newOpts.Fields) == 1 &&
+					strings.ReplaceAll(newOpts.Fields[0][1], "*", "") != underlyingStruct.Field(j).Name) {
+
+					return &ConflictingOptsError{
+						Opts: []Opt{
+							{Name: "Recursive", Value: false},
+							{Name: "Fields", Value: opts.Fields},
+						},
+						Message: fmt.Sprintf(
+							"cannot access field %s in type %v at path %s. If you need access to it, set opts.Recursive=true",
+							strings.Join(newOpts.Fields[0], "."),
+							underlyingStruct,
+							strings.Join(newStructPath, "."),
+						),
+					}
+				}
+
+				newOpts2 := newOpts
+				newOpts2.Fields = make([]reflection.Path, 0)
+
+				newStructMap := structTreeNode{}
+				newStructPath = append(newStructPath, underlyingStruct.Field(j).Name)
+				err = createStructMap(
+					db,
+					table,
+					Column{Table: table, Name: col.Name},
+                    underlyingStruct.Field(j).Type,
+                    newStructPath,
+					&newStructMap,
+                    newOpts2,
+				)
+				if err != nil {
+					return err
+				}
+
+				newOutterStructMap.path = fieldName
+				newOutterStructMap.column = Column{Table: table, Name: col.Name}
+				newOutterStructMap.children = []*structTreeNode{
+					&newStructMap,
+				}
+
+				structMap.children = append(structMap.children, &newOutterStructMap)
+            }
+        } else {
+			newStructMap := structTreeNode{}
+
+			err = createStructMap(
+				db,
+				table,
+				Column{Table: table, Name: col.Name},
+				fieldType,
+				newStructPath,
+				&newStructMap,
+				newOpts,
+			)
+			if err != nil {
+				return err
+			}
+
+			structMap.children = append(structMap.children, &newStructMap)
+        }
+	}
+
+	return nil
+}
+
+type update struct {
+	sets    []string
+	sql     string
+	args    []any
+}
+
+func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int, pgx.Tx, error) {
+	// gather data necessary for the query
+	structMap := structTreeNode{}
+
+	err := createStructMap(
+		db,
+		table,
+		Column{},
+		reflect.TypeOf(value),
+		reflection.NewPath(),
+		&structMap,
+		opts,
+	)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	columns := make([]Column, 0)
+	columnMap := make(map[Column]*reflection.Path)
+	joins := make([]join, 0)
+
+	structMap.gatherQueryData(reflection.NewPath(""), &columns, &columnMap, &joins)
+
+	for _, join := range joins {
+		// if we update a column that references another, we should update
+		// both in the referenced table and in the original table
+
+		if slices.Contains(columns, join.joined) {
+			columns = append(columns, join.original)
+			columnMap[join.original] = columnMap[join.joined]
+		}
+	}
+
+	// collect all tables involved in the update
+	tables := make([]Table, 0)
+	tables = append(tables, table)
+	tables = append(tables, utils.Map(joins, func(j join) Table {return j.joined.Table})...)
+
+	// create sql for the updates
+	statements := make([]update, 0)
+
+	// WHERE part of the update statement
+	whereParts := make([]string, 0)
+	for _, join := range joins {
+		whereParts = append(whereParts, fmt.Sprintf(
+			"%s = %s",
+			SanitizeIdentifier(
+				join.joined.Table.Schema,
+				join.joined.Table.Name,
+				join.joined.Name,
+			),
+			SanitizeIdentifier(
+				join.original.Table.Schema,
+				join.original.Table.Name,
+				join.original.Name,
+			),
+		))
+	}
+	if opts.Filters != nil {
+		whereParts = append(whereParts, opts.Filters.Sql())
+	}
+
+	whereSql := ""
+	if len(whereParts) > 0 {
+		whereSql = fmt.Sprintf(
+			"WHERE %s\n",
+			strings.Join(whereParts, " AND "),
+		)
+	}
+
+	// for the FROM part of sql
+	fromTables := slices.Clone(tables)
+	if opts.Filters != nil {
+		for _, c := range opts.Filters.Columns() {
+			if (!slices.Contains(fromTables, c.Table)) {
+				fromTables = append(fromTables, c.Table)
+			}
+		}
+	}
+
+	for i := len(tables)-1; i >= 0; i-- {
+		tb := tables[i]
+		upd := update{}
+
+		upd.sql = fmt.Sprintf(
+			"UPDATE %s\n",
+			pgx.Identifier([]string{tb.Schema, tb.Name}).Sanitize(),
+		)
+
+		j := 1
+		for _, c := range columns {
+			if c.Table == tb {
+				fieldValue, err := reflection.GetField(
+					reflect.ValueOf(value),
+					*columnMap[c],
+					false,
+				)
+				if err != nil {
+					return 0, nil, err
+				}
+
+				upd.sets = append(upd.sets, fmt.Sprintf(
+					"%s = $%d",
+					pgx.Identifier([]string{
+						c.Name,
+					}).Sanitize(),
+					j,
+				))
+				upd.args = append(upd.args, fieldValue.Interface())
+
+				j++
+			}
+		}
+
+		// if there is nothing to update in a table, do not include statement
+		if len(upd.sets) == 0 {
+			continue
+		}
+		upd.sql += "SET " + strings.Join(upd.sets, ",") + "\n"
+
+		if len(fromTables) > 1 {
+			upd.sql += fmt.Sprintf("FROM %s\n", strings.Join(
+				utils.Map(
+					utils.Filter(fromTables, func(t Table) bool {
+						return t != tb
+					}),
+					func(t Table) string {
+						return pgx.Identifier([]string{t.Schema, t.Name}).Sanitize()
+					},
+				),
+				", ",
+			))
+		}
+
+		upd.sql += ShiftArgs(whereSql, j-1)
+		if opts.Filters != nil {
+			upd.args = append(upd.args, opts.Filters.Args()...)
+		}
+
+		upd.sql += ";"
+
+		statements = append(statements, upd)
+	}
+
+	// actually run the sql
+	tx, err := db.conn.Begin(*db.context)
+	if err != nil {
+		return 0, nil, ConnectionErr
+	}
+
+	rowsAffected := 0
+	for _, statement := range statements {
+		cmdTag, err := tx.Exec(*db.context, statement.sql, statement.args...)
+		if err != nil {
+			tx.Rollback(*db.context)
+			tx.Conn().Close(*db.context)
+			return 0, nil, err
+		}
+
+		rowsAffected += int(cmdTag.RowsAffected())
+	}
+
+	return rowsAffected, tx, nil
+}
+
+func (db *DBWrapper) Update(value any, table Table, opts QueryOpts) (int, error) {
+	if opts.Fields == nil && !opts.AllFields {
+		return 0, &ConflictingOptsError{
+			Opts: []Opt{
+				{Name: "Fields", Value: opts.Fields},
+				{Name: "AllFields", Value: opts.AllFields},
+			},
+			Message: "either set 'AllFields' to true, or provide 'Fields' slice",
+		}
+	}
+
+	rowsAffected, tx, err := db.updateInternal(value, table, opts)
+	if err != nil {
+		// at this point, tx is already closed, so no need to rollback
+		return 0, err
+	}
+
+	if rowsAffected == 0 && !opts.AllowNone {
+		return 0, &RowNotFoundError{}
+	}
+
+	if opts.Limit != 0 && rowsAffected > opts.Limit {
+		tx.Rollback(*db.context)
+		tx.Conn().Close(*db.context)
+		return 0, &ExceededLimitError{RowCount: rowsAffected, Limit: opts.Limit}
+	}
+
+	err = tx.Commit(*db.context)
+	if err != nil {
+		tx.Rollback(*db.context)
+		tx.Conn().Close(*db.context)
+		return 0, ConnectionErr
+	}
+	return rowsAffected, nil
+}
+
+func (db *DBWrapper) Delete(table Table, opts QueryOpts) (int, error) {
+	if opts.Filters == nil {
+		if opts.AllowNone {
+			return 0, nil
+		}
+		return 0, &RowNotFoundError{}
+	}
+
+	sql := fmt.Sprintf(
+		"DELETE FROM %s WHERE %s",
+		pgx.Identifier([]string{table.Schema, table.Name}).Sanitize(),
+		opts.Filters.Sql(),
+	)
+
+	// begin transaction
+	tx, err := db.conn.Begin(*db.context)
+	if err != nil {
+		return 0, ConnectionErr
+	}
+
+	// execute sql
+	cmdTag, err := tx.Exec(*db.context, sql, opts.Filters.Args()...)
+	if err != nil {
+		tx.Rollback(*db.context)
+		tx.Conn().Close(*db.context)
+		return 0, err
+	}
+
+	// perform checks and rollback if needed
+	if cmdTag.RowsAffected() == 0 && !opts.AllowNone {
+		return 0, &RowNotFoundError{}
+	}
+
+	if opts.Limit != 0 && int(cmdTag.RowsAffected()) > opts.Limit {
+		tx.Rollback(*db.context)
+		tx.Conn().Close(*db.context)
+		return 0, &ExceededLimitError{
+			RowCount: int(cmdTag.RowsAffected()),
+			Limit: opts.Limit,
+		}
+	}
+
+	// commit and close transaction
+	err = tx.Commit(*db.context)
+	if err != nil {
+		tx.Rollback(*db.context)
+		tx.Conn().Close(*db.context)
+		return 0, ConnectionErr
+	}
+
+	tx.Conn().Close(*db.context)
+
+	// return number of rows affected
+	return int(cmdTag.RowsAffected()), nil
+}
+
+func (db *DBWrapper) QuerySql(values any, sql string, parameters ...any) (int, error) {
+	// check types
+	rv := reflect.ValueOf(values)
+
+	if rv.Kind() != reflect.Pointer || rv.Elem().Kind() != reflect.Slice || rv.Elem().Elem().Kind() != reflect.Struct {
+		return 0, &InvalidValueError{
+			Value: values,
+			Message: "values should be a pointer to a slice of structs",
+		}
+	}
+
+	// define some userful variables
+	s := rv.Elem()
+	typ := rv.Elem().Elem().Type()
+
+	fields := make([]reflect.StructField, 0)
+	for i := range typ.NumField() {
+		fields = append(fields, typ.Field(i))
+	}
+
+	// make query
+	rows, err := db.conn.Query(*db.context, sql, parameters...)
+	if err != nil {
+		return 0, fmt.Errorf("db: %w", err)
+	}
+
+	// decide in which order to scan into structs
+	fieldOrder := make([]int, 0)
+
+	descriptions := rows.FieldDescriptions()
+	for _, desc := range descriptions {
+		i := slices.IndexFunc(fields, func(field reflect.StructField) bool {
+			return field.Tag.Get("db") == desc.Name
+		})
+
+		if i != -1 {
+			fieldOrder = append(fieldOrder, i)
+		}
+	}
+
+	// scan values
+	n := 0
+	for rows.Next() {
+		s.Set(reflect.Append(s, reflect.Zero(typ)))
+
+		// collect pointers
+		pointers := make([]any, 0)
+
+		for _, i := range fieldOrder {
+			pointers = append(pointers, s.Index(s.Len()-1).Field(i).Addr())
+		}
+
+		err = rows.Scan(pointers...)
+		if err != nil {
+			var scanErr *pgx.ScanArgError
+			switch {
+			case errors.As(err, &scanErr):
+				return 0, fmt.Errorf(
+					"db scan: failed to scan column at index %d into value[%d][%d]: %w",
+					scanErr.ColumnIndex,
+					s.Len()-1,
+					scanErr.ColumnIndex,
+					err,
+				)
+			default:
+				return 0, fmt.Errorf("db: %w", err)
+			}
+		}
+
+		n++
+	}
+
+	return n, nil
+}
+
+func (db *DBWrapper) ExecuteSql(sql string, parameters ...any) (int, error) {
+	tag, err := db.conn.Exec(*db.context, sql, parameters...)
+	if err != nil {
+		return 0, fmt.Errorf("db: %w", err)
+	}
+
+	return int(tag.RowsAffected()), nil
+}
