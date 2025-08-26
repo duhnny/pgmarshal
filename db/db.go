@@ -318,18 +318,34 @@ func (db *DBWrapper) CreateRow(value any, table Table, opts QueryOpts) (int, err
 	return db.Create([]any{value}, table, opts)
 }
 
-func (db *DBWrapper) Query(values []any, table Table, opts QueryOpts) (int, error) {
-    // if values slice is empty
-    if len(values) == 0 {
-        if opts.AllowNone {
-            return 0, nil
-        }
-        return 0, &RowNotFoundError{}
-    }
+func (db *DBWrapper) Query(values any, table Table, opts QueryOpts) (int, error) {
+	// check types first
+    rv := reflect.ValueOf(values)
 
-    // get type
-    rv := reflect.ValueOf(values[0])
-    t := rv.Type()
+	if rv.Kind() != reflect.Pointer {
+		return 0, &InvalidValueError{
+			Value: values,
+			Message: "values should be a pointer to a slice of structs",
+		}
+	}
+
+	if rv.IsNil() {
+		return 0, &InvalidValueError{
+			Value: values,
+			Message: "nil pointer provided",
+		}
+	}
+
+	if rv.Type().Elem().Kind() != reflect.Slice || rv.Type().Elem().Elem().Kind() != reflect.Struct {
+		return 0, &InvalidValueError{
+			Value: values,
+			Message: "values should be a pointer to a slice of structs",
+		}
+	}
+
+    // define useful variables
+	s := rv.Elem()
+    t := rv.Type().Elem().Elem()
 
     // get all data necessary to make the query in one go
 	structMap := structTreeNode{}
@@ -467,12 +483,14 @@ func (db *DBWrapper) Query(values []any, table Table, opts QueryOpts) (int, erro
     }
 
     i := 0
-    for rows.Next() && i < len(values) {
+    for rows.Next() {
         addres := make([]any, 0)
 		valueMap := make(map[string]reflect.Value)
 
+		newValue := reflect.New(t).Elem()
+
         for _, column := range columns {
-            valueType, err := reflection.GetFieldType(reflect.ValueOf(values[i]).Type(), *columnMap[column])
+            valueType, err := reflection.GetFieldType(t, *columnMap[column])
             if err != nil {
                 panic(err)
             }
@@ -502,7 +520,7 @@ func (db *DBWrapper) Query(values []any, table Table, opts QueryOpts) (int, erro
 					panic(err)
 				}
 
-				parentValue, err := reflection.GetField(reflect.ValueOf(values[i]), path, false)
+				parentValue, err := reflection.GetField(newValue, path, false)
 				if err != nil {
 					panic(err)
 				}
@@ -569,7 +587,7 @@ func (db *DBWrapper) Query(values []any, table Table, opts QueryOpts) (int, erro
 				l = len(path)
 				path[l-1] = strings.ReplaceAll(path.Get(-1), "*", "")
 
-				wrappedValue, err := reflection.GetField(reflect.ValueOf(values[i]), path, false)
+				wrappedValue, err := reflection.GetField(newValue, path, false)
 				if err != nil {
 					panic(err)
 				}
@@ -595,7 +613,7 @@ func (db *DBWrapper) Query(values []any, table Table, opts QueryOpts) (int, erro
 				wrappedValue.SetZero()
 				continue
 			} else {
-				value, err := reflection.GetField(reflect.ValueOf(values[i]), *columnMap[column], true)
+				value, err := reflection.GetField(newValue, *columnMap[column], true)
 				if err != nil {
 					panic(err)
 				}
@@ -611,6 +629,7 @@ func (db *DBWrapper) Query(values []any, table Table, opts QueryOpts) (int, erro
 			}
 		}
 
+		s.Set(reflect.Append(s, newValue))
         i++
     }
 
@@ -622,9 +641,45 @@ func (db *DBWrapper) Query(values []any, table Table, opts QueryOpts) (int, erro
 }
 
 func (db *DBWrapper) QueryRow(value any, table Table, opts QueryOpts) error {
-	_, err := db.Query([]any{value}, table, opts)
+	// check value
+	rv := reflect.ValueOf(value)
 	
-	return err
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return &InvalidValueError{
+			Value: value,
+			Message: "value should be a non-nil pointer",
+		}
+	}
+
+	if !rv.Elem().CanSet() {
+		return &InvalidValueError{
+			Value: value,
+			Message: "value provided is not settable",
+		}
+	}
+
+	// create new slice for query
+	s := reflect.New(reflect.SliceOf(rv.Elem().Type()))
+
+	// query db
+	opts.Limit = 1
+
+	n, err := db.Query(s.Interface(), table, opts)
+	if err != nil {
+		return err
+	}
+	if n == 0 && !opts.AllowNone {
+		return &RowNotFoundError{}
+	}
+	if n > 1 {
+		panic(fmt.Errorf("db: something went wrong, the query with limit 1 returned more than 1 item"))
+	}
+
+	if n == 1 {
+		rv.Elem().Set(s.Elem().Index(0))
+	}
+	
+	return nil
 }
 
 type join struct {
@@ -778,9 +833,11 @@ func createStructMap(
 		}
 
 		structMap.table = table
+		structMap.ptrCount = strings.Count(structPath.Get(-1), "*")
+		structMap.path = strings.ReplaceAll(structPath.Get(-1), "*", "")
 		structMap.column = column
 
-	case reflect.Slice:
+	case reflect.Slice, reflect.Array:
 		if t.Elem().Kind() != reflect.Uint8 {
 			return &InvalidValueError{Value: t, Message: "fields should be either values, maps, structs or pointers to one of the three"}
 		}
@@ -1288,7 +1345,7 @@ func (db *DBWrapper) QuerySql(values any, sql string, parameters ...any) (int, e
 	// check types
 	rv := reflect.ValueOf(values)
 
-	if rv.Kind() != reflect.Pointer || rv.Elem().Kind() != reflect.Slice || rv.Elem().Elem().Kind() != reflect.Struct {
+	if rv.Kind() != reflect.Pointer || rv.Elem().Kind() != reflect.Slice || rv.Elem().Type().Elem().Kind() != reflect.Struct {
 		return 0, &InvalidValueError{
 			Value: values,
 			Message: "values should be a pointer to a slice of structs",
@@ -1297,7 +1354,7 @@ func (db *DBWrapper) QuerySql(values any, sql string, parameters ...any) (int, e
 
 	// define some userful variables
 	s := rv.Elem()
-	typ := rv.Elem().Elem().Type()
+	typ := rv.Elem().Type().Elem()
 
 	fields := make([]reflect.StructField, 0)
 	for i := range typ.NumField() {
@@ -1333,7 +1390,7 @@ func (db *DBWrapper) QuerySql(values any, sql string, parameters ...any) (int, e
 		pointers := make([]any, 0)
 
 		for _, i := range fieldOrder {
-			pointers = append(pointers, s.Index(s.Len()-1).Field(i).Addr())
+			pointers = append(pointers, s.Index(s.Len()-1).Field(i).Addr().Interface())
 		}
 
 		err = rows.Scan(pointers...)

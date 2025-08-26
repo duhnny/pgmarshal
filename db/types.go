@@ -56,6 +56,8 @@ const (
 	Neq                 // represents "<>" in sql statements
 	Gt                  // represents ">" in sql statements
 	Lt                  // represents "<" in sql statements
+	In                  // represents "IN" in sql statements
+	Any                 // represents "= ANY " in sql statements
 )
 
 func (op *operator) write() string {
@@ -68,6 +70,10 @@ func (op *operator) write() string {
 		return ">"
 	case Lt:
 		return "<"
+	case In:
+		return "IN"
+	case Any:
+		return "= ANY"
 	default:
 		return "="
 	}
@@ -77,12 +83,12 @@ type DB interface {
 	GetTableConfig(table Table) (TableConfig, error)
 
 	Create(values []any, table Table, opts QueryOpts) (int, error)
-	Query(values []any, table Table, opts QueryOpts) (int, error)
+	Query(values any, table Table, opts QueryOpts) (int, error)
 	Update(values any, table Table, opts QueryOpts) (int, error)
 	Delete(table Table, opts QueryOpts) (int, error)
 
-	CreateRow(values any, table Table, opts QueryOpts) (int, error)
-	QueryRow(values any, table Table, opts QueryOpts) error
+	CreateRow(value any, table Table, opts QueryOpts) (int, error)
+	QueryRow(value any, table Table, opts QueryOpts) error
 
 	QuerySql(values any, sql string, parameters ...any) (int, error)
 	ExecuteSql(sql string, parameters ...any) (int, error)
@@ -126,13 +132,13 @@ type filter struct {
 	value    any
 }
 
-type filters struct {
+type Filters struct {
 	filter   filter
 	conj     conjunction
-	children []*filters
+	children []*Filters
 }
 
-func (f *filters) Args() []any {
+func (f *Filters) Args() []any {
 	if len(f.children) == 0 {
 		// if right side of comparison is an identifier, use it as an identifier, instead of a value
 		// this allows for using columns in the right side, for example
@@ -142,13 +148,13 @@ func (f *filters) Args() []any {
 		return []any{f.filter.value}
 	}
 
-	return slices.Concat(utils.Map(f.children, func(c *filters) []any {
+	return slices.Concat(utils.Map(f.children, func(c *Filters) []any {
 		return c.Args()
 	})...)
 }
 
 // TODO: this can be optimized
-func (f *filters) Sql() string {
+func (f *Filters) Sql() string {
 	if len(f.children) == 0 {
 		// if right side of comparison is an identifier, use it as an identifier, instead of a value
 		// this allows for using columns in the right side, for example
@@ -157,6 +163,10 @@ func (f *filters) Sql() string {
 			rside = f.filter.value.(string)
 		} else {
 			rside = "$1"
+		}
+
+		if f.filter.operator == Any && reflect.ValueOf(f.filter.value).Kind() == reflect.Slice {
+			rside = "(" + rside + ")"
 		}
 
 		return fmt.Sprintf(
@@ -182,12 +192,12 @@ func (f *filters) Sql() string {
 }
 
 // returns all columns involved in the filters
-func (f *filters) Columns() []Column {
+func (f *Filters) Columns() []Column {
 	if len(f.children) == 0 {
 		return []Column{f.filter.column}
 	}
 
-	return slices.Concat(utils.Map(f.children, func(c *filters) []Column {
+	return slices.Concat(utils.Map(f.children, func(c *Filters) []Column {
 		return c.Columns()
 	})...)
 }
@@ -217,7 +227,7 @@ type Opt struct {
 }
 
 type QueryOpts struct {
-	Filters   *filters
+	Filters   *Filters
 	OrderBy   *OrderBy
 	Limit     int
 	Unique    bool

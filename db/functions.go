@@ -79,12 +79,12 @@ func GetOrderBy() OrderBy {
 	return OrderBy{}
 }
 
-func NewFilter(column Column, op operator, value any) *filters {
+func NewFilter(column Column, op operator, value any) *Filters {
 	if len(column.Name) == 0 {
 		panic(fmt.Errorf("db: column must not be empty"))
 	}
 
-	return &filters{
+	return &Filters{
 		filter: filter{
 			column: column,
 			operator: op,
@@ -93,8 +93,8 @@ func NewFilter(column Column, op operator, value any) *filters {
 	}
 }
 
-func JoinFilters(conj conjunction, filterSlice ...*filters) *filters {
-	return &filters{
+func JoinFilters(conj conjunction, filterSlice ...*Filters) *Filters {
+	return &Filters{
 		conj:     conj,
 		children: filterSlice,
 	}

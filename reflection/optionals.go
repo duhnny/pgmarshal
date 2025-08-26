@@ -1,6 +1,8 @@
 package reflection
 
-import "reflect"
+import (
+	"reflect"
+)
 
 func NewOptional[T any](v T) Optional[T] {
 	return Optional[T]{
@@ -43,7 +45,7 @@ func IsOptional(v any) bool {
 
 	if getInnerType.Type.NumIn() != 1 ||
 		getInnerType.Type.NumOut() != 1 ||
-		getInnerType.Type.Out(0) != reflect.TypeOf(reflect.TypeOf(0)) {
+		getInnerType.Type.Out(0) != reflect.TypeFor[reflect.Type]() {
 		return false
 	}
 
