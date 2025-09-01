@@ -3,6 +3,7 @@ package reflection
 import (
 	"errors"
 	"fmt"
+	"reflect"
 )
 
 var ErrInvalidStructPath = errors.New("path provided is not a valid struct path")
@@ -37,4 +38,20 @@ func (err *FieldNotFoundErr) Error() string {
         return fmt.Sprintf("reflection: %s", err.Message)
     }
     return fmt.Sprintf("reflection: field %s not found for value %v", err.Field, err.Value)
+}
+
+type WrongTypeError struct {
+	Value   any
+	Type    reflect.Type
+	Message string
+}
+
+func (err WrongTypeError) Error() string {
+	message := fmt.Sprintf("reflection: value %v is of wrong type for optional of type %v", err.Value, err.Type)
+
+	if message != "" {
+		message += ": " + err.Message
+	}
+
+	return message
 }

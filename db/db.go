@@ -274,12 +274,12 @@ func (db *DBWrapper) Create(values []any, table Table, opts QueryOpts) (int, err
 			for _, column := range sql[j].columns {
 				valuePlaceholders = append(valuePlaceholders, fmt.Sprintf("$%d", i))
 
-				fieldValue, err := reflection.GetField(
+				fieldValue, err := GetFieldMarshal(
 					reflect.ValueOf(value),
 					*columnMap[column],
 					false,
 				)
-				if err != nil {
+				if err != nil && err != reflection.ErrNoneValue {
 					return 0, err
 				}
 				
@@ -776,6 +776,23 @@ func createStructMap(
 	structMap *structTreeNode,
     opts QueryOpts,
 ) error {
+	if t.Implements(reflect.TypeFor[DbMarshaler]()) {
+		v, ok := reflect.Zero(t).Interface().(DbMarshaler)
+		if !ok {
+			panic(fmt.Errorf("db: type %v implements DbMarshaler but cannot be cast to it", t))
+		}
+
+		return createStructMap(
+			db,
+			table,
+			column,
+			v.GetInnerType(),
+			structPath,
+			structMap,
+			opts,
+		)
+	}
+
 	switch t.Kind() {
 	case
 		reflect.Int,
@@ -945,7 +962,7 @@ func createStructMap(
 		}
 
         // handle nested case
-        if col.IsForeignKey() && (fieldType.Kind() == reflect.Struct || reflection.PointsToKind(fieldType, reflect.Struct, true)) {
+        if col.IsForeignKey() && pointsToKind(fieldType, reflect.Struct, true, true) {
             if opts.Recursive {
 				// this join must be made before recursion, otherwise we end up
 				// with the opposite order
@@ -978,15 +995,15 @@ func createStructMap(
             } else {
 				// get rid of pointers, in order to be able to use .NumField()
 				newOutterStructMap := structTreeNode{}
-				underlyingStruct := fieldType
-				if reflection.PointsToKind(underlyingStruct, reflect.Struct, true) {
-					for underlyingStruct.Kind() == reflect.Pointer {
-						underlyingStruct = underlyingStruct.Elem()
 
-						// add pointer indicator
-						newStructPath.AddPtr(len(newStructPath)-1)
-						newOutterStructMap.ptrCount += 1
-					}
+				underlyingStruct, ptrCount, err := unwrapUntilKind(fieldType, reflect.Struct, true, true)
+				if err != nil {
+					panic(err)
+				}
+
+				for range ptrCount {
+					newStructPath.AddPtr(len(newStructPath)-1)
+					newOutterStructMap.ptrCount += 1
 				}
 
 				// find field that maps to referenced column
@@ -1176,13 +1193,18 @@ func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int
 		j := 1
 		for _, c := range columns {
 			if c.Table == tb {
-				fieldValue, err := reflection.GetField(
+				fieldValue, err := GetFieldMarshal(
 					reflect.ValueOf(value),
 					*columnMap[c],
 					false,
 				)
 				if err != nil {
-					return 0, nil, err
+					switch {
+					case err == reflection.ErrNoneValue:
+						continue
+					default:
+						return 0, nil, err
+					}
 				}
 
 				upd.sets = append(upd.sets, fmt.Sprintf(

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/danielbetoret/organization/services/api/src/reflection"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -71,14 +72,6 @@ func isCastableToDBType(v any, t DBType) bool {
 	return slices.Contains(allowed, valueType)
 }
 
-func EmptyFilterSlice() []filter {
-	return []filter{}
-}
-
-func GetOrderBy() OrderBy {
-	return OrderBy{}
-}
-
 func NewFilter(column Column, op operator, value any) *Filters {
 	if len(column.Name) == 0 {
 		panic(fmt.Errorf("db: column must not be empty"))
@@ -128,4 +121,171 @@ func JoinSql(sql []string, args [][]any) (string, []any) {
     }
 
     return newSql, newArgs
+}
+
+func GetFieldMarshal(v reflect.Value, path reflection.Path, initializeNilPointers bool) (reflect.Value, error) {
+	// check first if it is a marshaler
+	marsh, ok := v.Interface().(DbMarshaler)
+	fmt.Println(v.Interface())
+	if ok {
+		newValue, err := marsh.MarshalDb()
+		if err != nil {
+			switch {
+			case err == reflection.ErrNoneValue:
+				return reflect.Value{}, err
+			default:
+				panic(err)
+			}
+		}
+
+		return GetFieldMarshal(
+			reflect.ValueOf(newValue),
+			path,
+			initializeNilPointers,
+		)
+	}
+
+	// create copy
+	cpath := slices.Clone(path)
+
+    if cpath[0] == "" {
+        cpath = slices.Delete(cpath, 0, 1)
+    }
+
+    if len(cpath) == 0 {
+        return v, nil
+    }
+
+    // check for field
+	nextField := strings.ReplaceAll(cpath[0], "*", "")
+	pointerCount := strings.Repeat("*", strings.Count(cpath[0], "*"))
+    if len(nextField) > 0 {
+		switch (v.Kind()) {
+		case reflect.Map:
+			_, ok := v.Interface().(map[string]any)
+			if !ok {
+				return reflect.Value{}, &reflection.InvalidValueErr{
+					Value: v,
+					Message: "if field is a map, it should be indexed by a string",
+				}
+			}
+
+			return GetFieldMarshal(
+				v.MapIndex(reflect.ValueOf(nextField)),
+				append([]string{pointerCount}, cpath[1:]...),
+				initializeNilPointers,
+			)
+		case reflect.Struct:
+			return GetFieldMarshal(
+				v.FieldByName(nextField),
+				append([]string{pointerCount}, cpath[1:]...),
+				initializeNilPointers,
+			)
+		default:
+			return reflect.Value{}, &reflection.InvalidValueErr{
+				Value: v,
+				Message: fmt.Sprintf("value %v does not have field %s", v, cpath[0]),
+			}
+		}
+    }
+
+	// if we arrive here, it means there is no field name in path[0], and
+	// therefore, because path[0] != "", pointerCount != 0
+	if len(pointerCount) == 0 {
+		panic(fmt.Errorf("something went wrong, we should not be here"))
+	}
+
+	if v.Kind() != reflect.Pointer {
+		return reflect.Value{}, &reflection.InvalidValueErr{
+			Value: v,
+			Message: fmt.Sprintf("value %v should be a pointer", v),
+		}
+	}
+
+	if v.IsNil() {
+		if !initializeNilPointers {
+			return v, nil
+		}
+
+		if !v.CanSet() {
+			return reflect.Value{}, &reflection.InvalidValueErr{
+				Value: v,
+				Message: fmt.Sprintf("pointer value %v is nil and not settable. If you want GetField to return <nil>, set <initializeNilPointers> to false", v),
+			}
+		}
+
+		v.Set(reflect.New(v.Type().Elem()))
+	}
+
+	return GetFieldMarshal(
+		v.Elem(),
+		append([]string{strings.Replace(cpath[0], "*", "", 1)}, cpath[1:]...),
+		initializeNilPointers,
+	)
+}
+
+func pointsToKind(v reflect.Type, k reflect.Kind, recursive bool, ignoreOptionals bool) bool {
+	if v.Implements(reflect.TypeFor[WrappedType]()) && ignoreOptionals {
+		newValue, ok := reflect.Zero(v).Interface().(WrappedType)
+		if !ok {
+			panic(fmt.Errorf("db: type %v implements WrappedType but cannot be cast", v))
+		}
+
+		return pointsToKind(newValue.GetInnerType(), k, recursive, ignoreOptionals)
+	}
+
+	if v.Kind() == k {
+		return true
+	}
+
+	if v.Kind() != reflect.Pointer {
+		return false
+	}
+
+	if !recursive {
+		return false
+	}
+
+	return pointsToKind(v.Elem(), k, recursive, ignoreOptionals)
+}
+
+func unwrapUntilKind(
+	v reflect.Type,
+	k reflect.Kind,
+	recursive bool,
+	ignoreOptionals bool,
+) (typ reflect.Type, ptrCount int, err error) {
+	if v.Implements(reflect.TypeFor[WrappedType]()) && ignoreOptionals {
+		newValue, ok := reflect.Zero(v).Interface().(WrappedType)
+		if !ok {
+			panic(fmt.Errorf("db: type %v implements WrappedType but cannot be cast", v))
+		}
+
+		return unwrapUntilKind(newValue.GetInnerType(), k, recursive, ignoreOptionals)
+	}
+
+	if v.Kind() == k {
+		return v, 0, nil
+	}
+
+	if v.Kind() != reflect.Pointer {
+		return nil, 0, &InvalidValueError{
+			Value: v,
+			Message: fmt.Sprintf("db: value %v is not of kind %s and is not a pointer", v, k.String()),
+		}
+	}
+
+	if !recursive {
+		return nil, 0, &InvalidValueError{
+			Value: v,
+			Message: fmt.Sprintf("db: value %v is a pointer, but recursive is false", v),
+		}
+	}
+
+	newTyp, count, err := unwrapUntilKind(v.Elem(), k, recursive, ignoreOptionals)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return newTyp, count+1, err
 }

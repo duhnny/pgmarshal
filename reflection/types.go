@@ -129,3 +129,33 @@ func (op *Optional[T]) UnmarshalJSON(data []byte) error {
 
 	return nil
 }
+
+func (op Optional[T]) MarshalDb() (any, error) {
+
+	if !op.IsDefined() {
+		var v T
+		return v, ErrNoneValue
+	}
+
+	return op.Unwrap(), nil
+}
+
+func (op *Optional[T]) UnmarshalDb(v any) error {
+	if v == nil {
+		op.Defined = false
+		return nil
+	}
+
+	newValue, ok := v.(*T)
+	if !ok {
+		return WrongTypeError{
+			Value: v,
+			Type: reflect.TypeFor[T](),
+		}
+	}
+
+	op.Defined = true
+	op.Value = newValue
+
+	return nil
+}

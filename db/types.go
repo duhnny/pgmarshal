@@ -236,3 +236,17 @@ type QueryOpts struct {
 	Fields    []reflection.Path
 	AllFields bool
 }
+
+type WrappedType interface {
+	GetInnerType() reflect.Type
+}
+
+type DbMarshaler interface {
+	WrappedType
+	MarshalDb() (any, error)
+}
+
+type DbUnmarshaler interface {
+	WrappedType
+	UnmarshalDb(v any) error
+}
