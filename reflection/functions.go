@@ -16,6 +16,31 @@ func GetFields(t reflect.Type) []reflect.StructField {
 	return fields
 }
 
+// gets all fields, expanding embedded fields recursively
+func GetDeepFields(t reflect.Type) map[string]reflect.StructField {
+	fields := make(map[string]reflect.StructField, 0)
+
+	getDeepFieldsInner(t, NewPath(""), &fields)
+
+	return fields
+}
+
+func getDeepFieldsInner(t reflect.Type, path Path, fields *map[string]reflect.StructField) {
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+
+		newPath := slices.Clone(path)
+		newPath = append(newPath, field.Name)
+
+		if field.Anonymous {
+			getDeepFieldsInner(field.Type, newPath, fields)
+			continue
+		}
+
+		(*fields)[newPath.ToString()] = field
+	}
+}
+
 func IsNull(v reflect.Value) bool {
 	switch v.Kind() {
 	case reflect.Interface, reflect.Pointer:

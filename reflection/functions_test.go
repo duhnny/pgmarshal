@@ -53,3 +53,37 @@ func TestStripNil(t *testing.T) {
 		return
 	}
 }
+
+func TestGetDeepFields(t *testing.T) {
+	type s1 struct {
+		A string
+		B int
+	}
+
+	t1 := reflect.TypeFor[s1]()
+	f1 := GetDeepFields(t1)
+
+	if len(f1) != 2 {
+		t.Errorf("GetDeepFields is not getting all fields for basic structs")
+		return
+	}
+
+	if f1[0].Name != "A" || f1[1].Name != "B" {
+		t.Errorf("GetDeepFields is not getting fields properly for basic structs")
+	}
+
+	t2 := reflect.TypeFor[struct{
+		s1
+		C bool
+	}]()
+	f2 := GetDeepFields(t2)
+
+	if len(f2) != 3 {
+		t.Errorf("GetDeepFields is not getting all fields for embedded structs")
+		return
+	}
+	
+	if f2[0].Name != "A" || f2[1].Name != "B" || f2[2].Name != "C" {
+		t.Errorf("GetDeepFields is not getting fields properly for embedded structs")
+	}
+}

@@ -116,6 +116,19 @@ func (op Optional[T]) GetInnerType() reflect.Type {
 	return reflect.TypeOf(v)
 }
 
+// for json marshalling
+func (op Optional[T]) IsZero() bool {
+	return !op.Defined
+}
+
+func (op Optional[T]) MarshalJSON() ([]byte, error) {
+	if !op.Defined {
+		return nil, ErrNoneValue
+	}
+
+	return json.Marshal(op.Unwrap())
+}
+
 func (op *Optional[T]) UnmarshalJSON(data []byte) error {
 	var val *T
 
@@ -130,6 +143,10 @@ func (op *Optional[T]) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+func (op Optional[T]) GetDbType() reflect.Type {
+	return reflect.TypeFor[T]()
+}
+
 func (op Optional[T]) MarshalDb() (any, error) {
 
 	if !op.IsDefined() {
@@ -138,6 +155,26 @@ func (op Optional[T]) MarshalDb() (any, error) {
 	}
 
 	return op.Unwrap(), nil
+}
+
+func (op *Optional[T]) Scan(src any) error {
+	if src == nil {
+		op.Defined = false
+		return nil
+	}
+
+	newValue, ok := src.(*T)
+	if !ok {
+		return WrongTypeError{
+			Value: src,
+			Type: reflect.TypeFor[T](),
+		}
+	}
+
+	op.Defined = true
+	op.Value = newValue
+
+	return nil
 }
 
 func (op *Optional[T]) UnmarshalDb(v any) error {
