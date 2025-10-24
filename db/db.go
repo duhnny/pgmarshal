@@ -17,10 +17,23 @@ import (
 type DBWrapper struct {
 	context *context.Context
 	conn    *pgxpool.Pool
+	schema  utils.CachedMap[Table, TableConfig]
 }
 
 func (db *DBWrapper) GetTableConfig(table Table) (TableConfig, error) {
-	columnsQueryResults, err := db.conn.Query(*db.context, `
+	// check first if schema is in cache
+	cachedConfig := db.schema.Get(table)
+	if cachedConfig.IsDefined() {
+		return cachedConfig.Unwrap(), nil
+	}
+
+	conn, err := db.conn.Acquire(*db.context)
+	if err != nil {
+		return TableConfig{}, ConnectionErr
+	}
+	defer conn.Conn().Close(*db.context)
+
+	columnsQueryResults, err := conn.Query(*db.context, `
 		SELECT
 			table_schema,
 			table_name,
@@ -37,7 +50,7 @@ func (db *DBWrapper) GetTableConfig(table Table) (TableConfig, error) {
 	if err != nil {
 		panic(err)
 	}
-    defer columnsQueryResults.Close()
+    defer columnsQueryResults.Close() // this is redundant, but good practice
 
 	var columnsConfig = make([]ColumnConfig, 0)
 	for columnsQueryResults.Next() {
@@ -66,8 +79,18 @@ func (db *DBWrapper) GetTableConfig(table Table) (TableConfig, error) {
 
 		columnsConfig = append(columnsConfig, columnConfig)
 	}
+	
+	// release connection for reuse
+	columnsQueryResults.Close()
 
-	constraintsQueryResults, err := db.conn.Query(*db.context, `
+	// if no columns are found, we assume the table does not exist
+	if len(columnsConfig) == 0 {
+		return TableConfig{}, &TableNotFoundError{
+			Table: table,
+		}
+	}
+
+	constraintsQueryResults, err := conn.Query(*db.context, `
 		SELECT
 			ccu.column_name,
 			tc.constraint_type
@@ -86,7 +109,7 @@ func (db *DBWrapper) GetTableConfig(table Table) (TableConfig, error) {
 	if err != nil {
 		panic(err)
 	}
-	defer constraintsQueryResults.Close()
+	defer constraintsQueryResults.Close() // this is redundant, but good practice
 
 	for constraintsQueryResults.Next() {
 		var column_name string
@@ -110,8 +133,11 @@ func (db *DBWrapper) GetTableConfig(table Table) (TableConfig, error) {
 		}
 	}
 
+	// release connection for reuse
+	constraintsQueryResults.Close()
+
 	// query from https://stackoverflow.com/a/1152321
-	foreignKeyQueryResults, err := db.conn.Query(*db.context, `
+	foreignKeyQueryResults, err := conn.Query(*db.context, `
 		SELECT
 			kcu.column_name,
 			ccu.table_schema AS foreign_table_schema,
@@ -171,10 +197,15 @@ func (db *DBWrapper) GetTableConfig(table Table) (TableConfig, error) {
 		}
 	})
 
-	return TableConfig{
+	tc := TableConfig{
 		Table:   table,
 		Columns: columnsConfig,
-	}, nil
+	}
+
+	// put in cache
+	db.schema.Set(table, tc)
+
+	return tc, nil
 }
 
 // crud methods
@@ -184,16 +215,27 @@ type insert struct {
 	args []any
 }
 
-func (db *DBWrapper) Create(values []any, table Table, opts QueryOpts) (int, error) {
+func (db *DBWrapper) Create(values any, table Table, opts QueryOpts) (int, error) {
+	// check types first
+    s := reflect.ValueOf(values)
+
+	if s.Kind() != reflect.Slice || s.Type().Elem().Kind() != reflect.Struct {
+		return 0, &InvalidValueError{
+			Value: values,
+			Message: "values should be a pointer to a slice of structs",
+		}
+	}
+
+    // define useful variables
+    t := s.Type().Elem()
+
 	// require at least one value
-	if len(values) == 0 {
+	if s.Len() == 0 {
 		if opts.AllowNone {
 			return 0, nil
 		}
 		return 0, NoValuesErr
 	}
-
-	t := reflect.TypeOf(values[0])
 
 	// first of all, gather necessary data
 	structMap := structTreeNode{}
@@ -205,6 +247,7 @@ func (db *DBWrapper) Create(values []any, table Table, opts QueryOpts) (int, err
 		t,
 		reflection.NewPath(),
 		&structMap,
+		DbMarshalOpts{},
 		opts,
 	)
 	if err != nil {
@@ -234,8 +277,15 @@ func (db *DBWrapper) Create(values []any, table Table, opts QueryOpts) (int, err
 		}
 	}
 
+	// acquire connection
+	conn, err := db.conn.Acquire(*db.context)
+	if err != nil {
+		return 0, ConnectionErr
+	}
+	defer conn.Conn().Close(*db.context)
+
 	// begin transaction
-	tx, err := db.conn.Begin(*db.context)
+	tx, err := conn.Begin(*db.context)
 	if err != nil {
 		return 0, ConnectionErr
 	}
@@ -269,13 +319,13 @@ func (db *DBWrapper) Create(values []any, table Table, opts QueryOpts) (int, err
 	for j := range sql {
 		i := 1
 		valuesSql := make([]string, 0)
-		for _, value := range values {
+		for k := range s.Len() {
 			valuePlaceholders := make([]string, 0)
 			for _, column := range sql[j].columns {
 				valuePlaceholders = append(valuePlaceholders, fmt.Sprintf("$%d", i))
 
 				fieldValue, err := GetFieldMarshal(
-					reflect.ValueOf(value),
+					s.Index(k),
 					*columnMap[column],
 					false,
 				)
@@ -315,7 +365,19 @@ func (db *DBWrapper) Create(values []any, table Table, opts QueryOpts) (int, err
 }
 
 func (db *DBWrapper) CreateRow(value any, table Table, opts QueryOpts) (int, error) {
-	return db.Create([]any{value}, table, opts)
+	rv := reflect.ValueOf(value)
+	
+	if rv.Kind() != reflect.Struct {
+		return 0, &InvalidValueError{
+			Value: value,
+			Message: "value should be a struct",
+		}
+	}
+
+	s := reflect.New(reflect.SliceOf(rv.Type()))
+	s.Elem().Set(reflect.Append(s.Elem(), rv))
+
+	return db.Create(s.Elem().Interface(), table, opts)
 }
 
 func (db *DBWrapper) Query(values any, table Table, opts QueryOpts) (int, error) {
@@ -357,6 +419,7 @@ func (db *DBWrapper) Query(values any, table Table, opts QueryOpts) (int, error)
         t,
         reflection.NewPath(),
 		&structMap,
+		DbMarshalOpts{},
         opts,
     )
     if err != nil {
@@ -373,7 +436,7 @@ func (db *DBWrapper) Query(values any, table Table, opts QueryOpts) (int, error)
 		&joins,
 	)
 	if err != nil {
-		panic(err)
+		return 0, fmt.Errorf("db: failed to gather data for query with error: %w", err)
 	}
     if len(columns) == 0 {
         return 0, NoMatchingColumnErr
@@ -476,8 +539,15 @@ func (db *DBWrapper) Query(values any, table Table, opts QueryOpts) (int, error)
 
     finalSql += ";"
 
+	// acquire connection
+	conn, err := db.conn.Acquire(*db.context)
+	if err != nil {
+		return 0, ConnectionErr
+	}
+	defer conn.Conn().Close(*db.context)
+
     // actually query db
-    rows, err := db.conn.Query(*db.context, finalSql, finalArgs...)
+    rows, err := conn.Query(*db.context, finalSql, finalArgs...)
     if err != nil {
 		return 0, fmt.Errorf("db: could not send query: %w", err)
     }
@@ -768,12 +838,13 @@ func (s *structTreeNode) gatherQueryData(
 }
 
 func createStructMap(
-    db *DBWrapper,
+    db DB,
     table Table,
 	column Column,
     t reflect.Type,
     structPath reflection.Path,
 	structMap *structTreeNode,
+	marshalOpts DbMarshalOpts,
     opts QueryOpts,
 ) error {
 	if t.Implements(reflect.TypeFor[DbMarshaler]()) {
@@ -786,9 +857,10 @@ func createStructMap(
 			db,
 			table,
 			column,
-			v.GetInnerType(),
+			v.GetDbType(),
 			structPath,
 			structMap,
+			marshalOpts,
 			opts,
 		)
 	}
@@ -897,6 +969,7 @@ func createStructMap(
             t.Elem(),
             newPath,
 			structMap,
+			marshalOpts,
             opts,
         )
 
@@ -912,10 +985,59 @@ func createStructMap(
 	// now, if the structure is a map, we loop over columns of a table,
 	// and, if it is a struct, we loop over its fields
 	for i := 0; i < t.NumField(); i++ {
-		columnName := t.Field(i).Tag.Get("db")
+		field := t.Field(i)
+
+        // initialize next struct path to keep track of where we are in the struct
+        newStructPath := slices.Clone(structPath)
+		newStructPath = append(newStructPath, field.Name)
+
+		// ignore marshal opts if invalid
+		newMarshalOpts, err := parseDbMarshalOpts(field.Tag.Get("db"))
+		if err != nil {
+			continue
+		}
+
+		// if field is embedded, go inside
+		isAnonymousAndSpreadNotDefined := field.Anonymous && !newMarshalOpts.Spread.IsDefined()
+		isSetToSpread := newMarshalOpts.Spread.IsDefined() && newMarshalOpts.Spread.Unwrap()
+		if isAnonymousAndSpreadNotDefined || isSetToSpread {
+			// right now, we only support embedded structs
+			if field.Type.Kind() == reflect.Struct {
+				newStructMap := structTreeNode{}
+
+                err = createStructMap(
+                    db,
+                    table,
+					column,
+                    field.Type,
+                    newStructPath,
+					&newStructMap,
+					newMarshalOpts,
+                    opts,
+                )
+                if err != nil {
+                    return err
+                }
+
+				if len(newStructMap.children) == 0 {
+					continue
+				}
+
+				newStructMap.path = strings.ReplaceAll(newStructPath.Get(-1), "*", "")
+				structMap.children = append(structMap.children, &newStructMap)
+			}
+
+			continue
+		}
+
+		columnName := newMarshalOpts.Name
 
 		if columnName == "" {
 			continue
+		}
+
+		if marshalOpts.Prefix != nil {
+			columnName = *marshalOpts.Prefix + "_" + columnName
 		}
 
 		// find column the field refers to
@@ -933,12 +1055,8 @@ func createStructMap(
 			continue
 		}
 
-        fieldType := t.Field(i).Type
-		fieldName := t.Field(i).Name
-
-        // initialize next struct path to keep track of where we are in the struct
-        newStructPath := slices.Clone(structPath)
-		newStructPath = append(newStructPath, fieldName)
+        fieldType := field.Type
+		fieldName := field.Name
 
         // filter columns
         if !opts.AllFields && !slices.ContainsFunc(opts.Fields, func(f reflection.Path) bool {
@@ -975,6 +1093,7 @@ func createStructMap(
                     fieldType,
                     newStructPath,
 					&newStructMap,
+					newMarshalOpts,
                     newOpts,
                 )
                 if err != nil {
@@ -1058,6 +1177,7 @@ func createStructMap(
                     underlyingStruct.Field(j).Type,
                     newStructPath,
 					&newStructMap,
+					newMarshalOpts,
                     newOpts2,
 				)
 				if err != nil {
@@ -1082,6 +1202,7 @@ func createStructMap(
 				fieldType,
 				newStructPath,
 				&newStructMap,
+				newMarshalOpts,
 				newOpts,
 			)
 			if err != nil {
@@ -1112,6 +1233,7 @@ func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int
 		reflect.TypeOf(value),
 		reflection.NewPath(),
 		&structMap,
+		DbMarshalOpts{},
 		opts,
 	)
 	if err != nil {
@@ -1378,28 +1500,26 @@ func (db *DBWrapper) QuerySql(values any, sql string, parameters ...any) (int, e
 	s := rv.Elem()
 	typ := rv.Elem().Type().Elem()
 
-	fields := make([]reflect.StructField, 0)
-	for i := range typ.NumField() {
-		fields = append(fields, typ.Field(i))
-	}
+	fields := reflection.GetDeepFields(typ)
 
 	// make query
 	rows, err := db.conn.Query(*db.context, sql, parameters...)
 	if err != nil {
 		return 0, fmt.Errorf("db: %w", err)
 	}
+	defer rows.Close()
 
 	// decide in which order to scan into structs
-	fieldOrder := make([]int, 0)
+	fieldOrder := make([]string, 0)
 
 	descriptions := rows.FieldDescriptions()
 	for _, desc := range descriptions {
-		i := slices.IndexFunc(fields, func(field reflect.StructField) bool {
+		p := utils.KeyFunc(fields, func(path string, field reflect.StructField) bool {
 			return field.Tag.Get("db") == desc.Name
 		})
 
-		if i != -1 {
-			fieldOrder = append(fieldOrder, i)
+		if p != nil {
+			fieldOrder = append(fieldOrder, *p)
 		}
 	}
 
@@ -1411,8 +1531,18 @@ func (db *DBWrapper) QuerySql(values any, sql string, parameters ...any) (int, e
 		// collect pointers
 		pointers := make([]any, 0)
 
-		for _, i := range fieldOrder {
-			pointers = append(pointers, s.Index(s.Len()-1).Field(i).Addr().Interface())
+		for _, pathStr := range fieldOrder {
+			path, err := reflection.PathFromString(pathStr)
+			if err != nil {
+				panic(fmt.Errorf("db: path should definitely be a valid path: %w", err))
+			}
+
+			field, err := reflection.GetField(s.Index(s.Len()-1), path, false)
+			if err != nil {
+				return 0, fmt.Errorf("db: failed to access field at path %s", path.ToString())
+			}
+
+			pointers = append(pointers, field.Addr().Interface())
 		}
 
 		err = rows.Scan(pointers...)

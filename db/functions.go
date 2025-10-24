@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/danielbetoret/organization/services/api/src/reflection"
+	"github.com/danielbetoret/organization/services/api/src/utils"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -23,10 +24,20 @@ var reflectFloat64 = reflect.TypeOf(float64(0))
 var reflectByteSlice = reflect.TypeOf([]byte(""))
 var reflectTime = reflect.TypeOf(time.Now())
 
-func NewDBWrapper(ctx *context.Context, conn *pgxpool.Pool) DBWrapper {
+type ConnectionOpts struct {
+	SchemaCacheInterval utils.Optional[time.Duration]
+}
+
+func NewDBWrapper(ctx *context.Context, conn *pgxpool.Pool, opts ConnectionOpts) DBWrapper {
+	schemaCacheInterval := time.Minute
+	if opts.SchemaCacheInterval.IsDefined() {
+		schemaCacheInterval = opts.SchemaCacheInterval.Unwrap()
+	}
+
 	return DBWrapper{
 		context: ctx,
 		conn:    conn,
+		schema:  utils.NewCachedMap[Table, TableConfig](schemaCacheInterval),
 	}
 }
 
@@ -126,7 +137,6 @@ func JoinSql(sql []string, args [][]any) (string, []any) {
 func GetFieldMarshal(v reflect.Value, path reflection.Path, initializeNilPointers bool) (reflect.Value, error) {
 	// check first if it is a marshaler
 	marsh, ok := v.Interface().(DbMarshaler)
-	fmt.Println(v.Interface())
 	if ok {
 		newValue, err := marsh.MarshalDb()
 		if err != nil {
@@ -288,4 +298,53 @@ func unwrapUntilKind(
 	}
 
 	return newTyp, count+1, err
+}
+
+func parseDbMarshalOpts(tag string) (DbMarshalOpts, error) {
+	optSlice := strings.Split(tag, ",")
+
+	name := optSlice[0]
+
+	spread := reflection.Optional[bool]{}
+	i := slices.IndexFunc(optSlice, func(opt string) bool {
+		return strings.HasPrefix(opt, "spread")
+	})
+	if i != -1 {
+		if strings.HasPrefix(optSlice[i], "spread=") {
+			val := strings.Replace(optSlice[i], "spread=", "", 1)
+
+			switch (val) {
+			case "true":
+				spread = reflection.NewOptional(true)
+			case "false":
+				spread = reflection.NewOptional(false)
+			default:
+				return DbMarshalOpts{}, InvalidMarshalOptsError{
+					Opt: "spread",
+					Value: val,
+				}
+			}
+		} else if (optSlice[i] == "spread") {
+			spread = reflection.NewOptional(true)
+		} else {
+			return DbMarshalOpts{}, InvalidMarshalOptsError{
+				Opt: "spread",
+				Value: optSlice[i],
+			}
+		}
+	}
+
+	var prefix *string
+	i = slices.IndexFunc(optSlice, func(opt string) bool {
+		return strings.HasPrefix(opt, "prefix=")
+	})
+	if i != -1 {
+		*prefix = strings.Replace(optSlice[i], "prefix=", "", 1)
+	}
+
+	return DbMarshalOpts{
+		Name: name,
+		Spread: spread,
+		Prefix: prefix,
+	}, nil
 }

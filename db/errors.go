@@ -25,6 +25,14 @@ func (err *ColumnNotNullableError) Error() string {
 	return fmt.Sprintf("db: Field %s must not be null", err.fieldName)
 }
 
+type TableNotFoundError struct {
+	Table Table
+}
+
+func (err *TableNotFoundError) Error() string {
+	return fmt.Sprintf("db: table %s not found in schema %s", err.Table.Name, err.Table.Schema)
+}
+
 type ColumnNotFoundError struct {
 	Table  Table
 	Column string
@@ -79,4 +87,17 @@ func (err *ExceededLimitError) Error() string {
 		err.RowCount,
 		err.Limit,
 	)
+}
+
+type InvalidMarshalOptsError struct {
+	Opt   string
+	Value string
+}
+
+func (err InvalidMarshalOptsError) Error() string {
+	if err.Opt == "" {
+		return "db: invalid marshal opts passed"
+	}
+
+	return fmt.Sprintf("db: invalid value for option %s: %s", err.Opt, err.Value)
 }

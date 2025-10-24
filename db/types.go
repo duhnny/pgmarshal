@@ -82,7 +82,7 @@ func (op *operator) write() string {
 type DB interface {
 	GetTableConfig(table Table) (TableConfig, error)
 
-	Create(values []any, table Table, opts QueryOpts) (int, error)
+	Create(values any, table Table, opts QueryOpts) (int, error)
 	Query(values any, table Table, opts QueryOpts) (int, error)
 	Update(values any, table Table, opts QueryOpts) (int, error)
 	Delete(table Table, opts QueryOpts) (int, error)
@@ -241,12 +241,22 @@ type WrappedType interface {
 	GetInnerType() reflect.Type
 }
 
+type DbModel interface {
+	GetDbType() reflect.Type
+}
+
 type DbMarshaler interface {
-	WrappedType
+	DbModel
 	MarshalDb() (any, error)
 }
 
 type DbUnmarshaler interface {
-	WrappedType
+	DbModel
 	UnmarshalDb(v any) error
+}
+
+type DbMarshalOpts struct {
+	Name   string
+	Spread reflection.Optional[bool]
+	Prefix *string
 }
