@@ -25,19 +25,30 @@ var reflectByteSlice = reflect.TypeOf([]byte(""))
 var reflectTime = reflect.TypeOf(time.Now())
 
 type ConnectionOpts struct {
-	SchemaCacheInterval utils.Optional[time.Duration]
+	// default: 1 minute
+	SchemaCacheInterval              utils.Optional[time.Duration]
+	// default: 100
+	BatchInsertOptimizationThreshold utils.Optional[int]
 }
 
 func NewDBWrapper(ctx *context.Context, conn *pgxpool.Pool, opts ConnectionOpts) DBWrapper {
-	schemaCacheInterval := time.Minute
+	schemaCacheInterval := K_DefaultSchemaCacheInterval // default value is a minute
 	if opts.SchemaCacheInterval.IsDefined() {
 		schemaCacheInterval = opts.SchemaCacheInterval.Unwrap()
+	}
+
+	batchInsertOptimizationThreshold := K_DefaultBatchInsertOptimizationThreshold
+	if opts.BatchInsertOptimizationThreshold.IsDefined() {
+		batchInsertOptimizationThreshold = opts.BatchInsertOptimizationThreshold.Unwrap()
 	}
 
 	return DBWrapper{
 		context: ctx,
 		conn:    conn,
 		schema:  utils.NewCachedMap[Table, TableConfig](schemaCacheInterval),
+		config:  dbConfig{
+			batchInsertOptimizationThreshold: batchInsertOptimizationThreshold,
+		},
 	}
 }
 
@@ -140,8 +151,8 @@ func GetFieldMarshal(v reflect.Value, path reflection.Path, initializeNilPointer
 	if ok {
 		newValue, err := marsh.MarshalDb()
 		if err != nil {
-			switch {
-			case err == reflection.ErrNoneValue:
+			switch err.(type) {
+			case utils.NoValueError:
 				return reflect.Value{}, err
 			default:
 				panic(err)

@@ -8,16 +8,22 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/danielbetoret/organization/services/api/src/myerrors"
 	"github.com/danielbetoret/organization/services/api/src/reflection"
 	"github.com/danielbetoret/organization/services/api/src/utils"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type dbConfig struct {
+	batchInsertOptimizationThreshold int
+}
+
 type DBWrapper struct {
 	context *context.Context
 	conn    *pgxpool.Pool
 	schema  utils.CachedMap[Table, TableConfig]
+	config  dbConfig
 }
 
 func (db *DBWrapper) GetTableConfig(table Table) (TableConfig, error) {
@@ -210,9 +216,39 @@ func (db *DBWrapper) GetTableConfig(table Table) (TableConfig, error) {
 
 // crud methods
 type insert struct {
+	table   Table
 	columns []Column
-	sql string
-	args []any
+	values  [][]any
+}
+
+type insertTable struct {
+	table   Table
+	columns []Column
+}
+
+func (ins insert) write() (string, []any, error) {
+	sql := fmt.Sprintf(
+		"INSERT INTO %s (%s) VALUES\n",
+		ins.table.Sanitize(),
+		strings.Join(utils.Map(ins.columns, func(c Column) string {
+			return string(SanitizeIdentifier(c.Name))
+		}), ", "),
+	)
+
+	valuesSql, args := JoinSql(
+		utils.Map(ins.values, func(values []any) string {
+			placeholders := make([]string, 0)
+
+			for i := range values {
+				placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
+			}
+
+			return "(" + strings.Join(placeholders, ", ") + ")\n"
+		}),
+		ins.values,
+	)
+
+	return sql + valuesSql + ";", args, nil
 }
 
 func (db *DBWrapper) Create(values any, table Table, opts QueryOpts) (int, error) {
@@ -263,10 +299,7 @@ func (db *DBWrapper) Create(values any, table Table, opts QueryOpts) (int, error
 		return 0, err
 	}
 
-	insertTables := append([]Table{table}, utils.Map(joins, func(j join) Table {
-		return j.joined.Table
-	})...)
-	
+	// fill in both the joined column and the original column
 	for _, join := range joins {
 		if slices.Contains(columns, join.joined) && !slices.Contains(columns, join.original) {
 			columns = append(columns, join.original)
@@ -275,6 +308,99 @@ func (db *DBWrapper) Create(values any, table Table, opts QueryOpts) (int, error
 			columns = append(columns, join.joined)
 			columnMap[join.joined] = columnMap[join.original]
 		}
+	}
+
+	// collect tables for insert
+	insertTables := make([]insertTable, 0)
+
+	// first, the original table
+	originalTable := insertTable{
+		table: table,
+		columns: make([]Column, 0),
+	}
+	for _, col := range columns {
+		if col.Table == table {
+			originalTable.columns = append(originalTable.columns, col)
+		}
+	}
+	insertTables = append(insertTables, originalTable)
+
+	// now, the jois
+	for _, join := range joins {
+		joinedTable := insertTable{
+			table: join.joined.Table,
+			columns: make([]Column, 0),
+		}
+
+		for _, col := range columns {
+			if col.Table == joinedTable.table {
+				joinedTable.columns = append(joinedTable.columns, col)
+			}
+		}
+	}
+
+	// create inserts for each table
+	// we run it in the reverse order of the joins, because
+	rawInserts := make([]insert, 0)
+	for i := len(insertTables)-1; i >= 0; i-- {
+		tb := insertTables[i]
+
+		for j := range s.Len() {
+			ins := insert{
+				table: tb.table,
+				columns: make([]Column, 0),
+				values: make([][]any, 0),
+			}
+
+			val := make([]any, 0)
+
+			columnLoop:
+			for _, col := range tb.columns {
+				fieldValue, err := GetFieldMarshal(
+					s.Index(j),
+					*columnMap[col],
+					false,
+				)
+				if err != nil {
+					// in case of an optional with no value, do not insert column
+					if myerrors.Contains[utils.NoValueError](err) {
+						continue columnLoop
+					}
+
+					return 0, err
+				}
+
+				val = append(val, fieldValue.Interface())
+				ins.columns = append(ins.columns, col)
+			}
+
+			ins.values = append(ins.values, val)
+			rawInserts = append(rawInserts, ins)
+		}
+	}
+
+	// the following is not necessary, but it is a nice optimization for batch inserts:
+	// instead of generating sql for each row to be inserted, we will collect the
+	// inserts with the same columns, and create one insert statement for each one
+	inserts := make([]insert, 0)
+	if (s.Len() > db.config.batchInsertOptimizationThreshold) {
+		for _, rawInsert := range rawInserts {
+			i := slices.IndexFunc(inserts, func(insert insert) bool {
+				return slices.Equal(insert.columns, rawInsert.columns)
+			})
+
+			// if group of columns does not exist, append
+			// append only values otherwise
+			// obs.: the order of the columns will always be the same
+			// in virtue of the process taken to build the inserts
+			if i == -1 {
+				inserts = append(inserts, rawInsert)
+			} else if len(rawInsert.values) != 0 {
+				inserts[i].values = append(inserts[i].values, rawInsert.values...)
+			}
+		}
+	} else {
+		inserts = rawInserts
 	}
 
 	// acquire connection
@@ -289,64 +415,15 @@ func (db *DBWrapper) Create(values any, table Table, opts QueryOpts) (int, error
 	if err != nil {
 		return 0, ConnectionErr
 	}
-
-	// create sql for each table
-	// we run it in the reverse order of the joins, because
-	sql := make([]insert, 0)
-	for i := len(insertTables)-1; i >= 0; i-- {
-		tb := insertTables[i]
-
-		ins := insert{}
-		for _, c := range columns {
-			if c.Table == tb {
-				ins.columns = append(ins.columns, c)
-			}
-		}
-
-		ins.sql = fmt.Sprintf(
-			"INSERT INTO %s (%s)\nVALUES ",
-			pgx.Identifier([]string{tb.Schema, tb.Name}).Sanitize(),
-			strings.Join(utils.Map(ins.columns, func(c Column) string {
-				return pgx.Identifier([]string{
-					c.Name,
-				}).Sanitize()
-			}), ","),
-		)
-
-		sql = append(sql, ins)
-	}
-
-	for j := range sql {
-		i := 1
-		valuesSql := make([]string, 0)
-		for k := range s.Len() {
-			valuePlaceholders := make([]string, 0)
-			for _, column := range sql[j].columns {
-				valuePlaceholders = append(valuePlaceholders, fmt.Sprintf("$%d", i))
-
-				fieldValue, err := GetFieldMarshal(
-					s.Index(k),
-					*columnMap[column],
-					false,
-				)
-				if err != nil && err != reflection.ErrNoneValue {
-					return 0, err
-				}
-				
-				sql[j].args = append(sql[j].args, fieldValue.Interface())
-
-				i++
-			}
-			valuesSql = append(valuesSql, "(" + strings.Join(valuePlaceholders, ",") + ")")
-		}
-
-
-		sql[j].sql += strings.Join(valuesSql, ",\n") + ";\n"
-	}
 	
 	rowsAffected := 0
-	for _, ins := range sql {
-		ctag, err := tx.Exec(*db.context, ins.sql, ins.args...)
+	for _, ins := range inserts {
+		sql, args, err := ins.write()
+		if err != nil {
+			return 0, fmt.Errorf("db: failed to write sql with error: %w", err)
+		}
+
+		ctag, err := tx.Exec(*db.context, sql, args...)
 		if err != nil {
 			tx.Rollback(*db.context)
 			return 0, err
@@ -1321,8 +1398,8 @@ func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int
 					false,
 				)
 				if err != nil {
-					switch {
-					case err == reflection.ErrNoneValue:
+					switch err.(type) {
+					case utils.NoValueError:
 						continue
 					default:
 						return 0, nil, err
@@ -1372,12 +1449,19 @@ func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int
 		statements = append(statements, upd)
 	}
 
-	// actually run the sql
-	tx, err := db.conn.Begin(*db.context)
+	// acquire connection
+	conn, err := db.conn.Acquire(*db.context)
 	if err != nil {
 		return 0, nil, ConnectionErr
 	}
 
+	// begin transaction
+	tx, err := conn.Begin(*db.context)
+	if err != nil {
+		return 0, nil, ConnectionErr
+	}
+
+	// actually run the sql
 	rowsAffected := 0
 	for _, statement := range statements {
 		cmdTag, err := tx.Exec(*db.context, statement.sql, statement.args...)
@@ -1443,8 +1527,15 @@ func (db *DBWrapper) Delete(table Table, opts QueryOpts) (int, error) {
 		opts.Filters.Sql(),
 	)
 
+	// acquire connection
+	conn, err := db.conn.Acquire(*db.context)
+	if err != nil {
+		return 0, ConnectionErr
+	}
+	defer conn.Conn().Close(*db.context)
+
 	// begin transaction
-	tx, err := db.conn.Begin(*db.context)
+	tx, err := conn.Begin(*db.context)
 	if err != nil {
 		return 0, ConnectionErr
 	}
@@ -1502,8 +1593,15 @@ func (db *DBWrapper) QuerySql(values any, sql string, parameters ...any) (int, e
 
 	fields := reflection.GetDeepFields(typ)
 
+	// acquire connection
+	conn, err := db.conn.Acquire(*db.context)
+	if err != nil {
+		return 0, ConnectionErr
+	}
+	defer conn.Conn().Close(*db.context)
+
 	// make query
-	rows, err := db.conn.Query(*db.context, sql, parameters...)
+	rows, err := conn.Query(*db.context, sql, parameters...)
 	if err != nil {
 		return 0, fmt.Errorf("db: %w", err)
 	}
@@ -1569,7 +1667,15 @@ func (db *DBWrapper) QuerySql(values any, sql string, parameters ...any) (int, e
 }
 
 func (db *DBWrapper) ExecuteSql(sql string, parameters ...any) (int, error) {
-	tag, err := db.conn.Exec(*db.context, sql, parameters...)
+	// acquire connection
+	conn, err := db.conn.Acquire(*db.context)
+	if err != nil {
+		return 0, ConnectionErr
+	}
+	defer conn.Conn().Close(*db.context)
+
+	// execute sql
+	tag, err := conn.Exec(*db.context, sql, parameters...)
 	if err != nil {
 		return 0, fmt.Errorf("db: %w", err)
 	}
