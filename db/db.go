@@ -37,7 +37,7 @@ func (db *DBWrapper) GetTableConfig(table Table) (TableConfig, error) {
 	if err != nil {
 		return TableConfig{}, ConnectionErr
 	}
-	defer conn.Conn().Close(*db.context)
+	defer conn.Release()
 
 	columnsQueryResults, err := conn.Query(*db.context, `
 		SELECT
@@ -408,7 +408,7 @@ func (db *DBWrapper) Create(values any, table Table, opts QueryOpts) (int, error
 	if err != nil {
 		return 0, ConnectionErr
 	}
-	defer conn.Conn().Close(*db.context)
+	defer conn.Release()
 
 	// begin transaction
 	tx, err := conn.Begin(*db.context)
@@ -621,7 +621,7 @@ func (db *DBWrapper) Query(values any, table Table, opts QueryOpts) (int, error)
 	if err != nil {
 		return 0, ConnectionErr
 	}
-	defer conn.Conn().Close(*db.context)
+	defer conn.Release()
 
     // actually query db
     rows, err := conn.Query(*db.context, finalSql, finalArgs...)
@@ -1299,7 +1299,7 @@ type update struct {
 	args    []any
 }
 
-func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int, pgx.Tx, error) {
+func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int, pgx.Tx, *pgxpool.Conn, error) {
 	// gather data necessary for the query
 	structMap := structTreeNode{}
 
@@ -1314,7 +1314,7 @@ func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int
 		opts,
 	)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 
 	columns := make([]Column, 0)
@@ -1402,7 +1402,7 @@ func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int
 					case utils.NoValueError:
 						continue
 					default:
-						return 0, nil, err
+						return 0, nil, nil, err
 					}
 				}
 
@@ -1452,13 +1452,13 @@ func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int
 	// acquire connection
 	conn, err := db.conn.Acquire(*db.context)
 	if err != nil {
-		return 0, nil, ConnectionErr
+		return 0, nil, nil, ConnectionErr
 	}
 
 	// begin transaction
 	tx, err := conn.Begin(*db.context)
 	if err != nil {
-		return 0, nil, ConnectionErr
+		return 0, nil, nil, ConnectionErr
 	}
 
 	// actually run the sql
@@ -1467,14 +1467,14 @@ func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int
 		cmdTag, err := tx.Exec(*db.context, statement.sql, statement.args...)
 		if err != nil {
 			tx.Rollback(*db.context)
-			tx.Conn().Close(*db.context)
-			return 0, nil, err
+			conn.Release()
+			return 0, nil, nil, err
 		}
 
 		rowsAffected += int(cmdTag.RowsAffected())
 	}
 
-	return rowsAffected, tx, nil
+	return rowsAffected, tx, conn, nil
 }
 
 func (db *DBWrapper) Update(value any, table Table, opts QueryOpts) (int, error) {
@@ -1488,11 +1488,14 @@ func (db *DBWrapper) Update(value any, table Table, opts QueryOpts) (int, error)
 		}
 	}
 
-	rowsAffected, tx, err := db.updateInternal(value, table, opts)
+	rowsAffected, tx, conn, err := db.updateInternal(value, table, opts)
 	if err != nil {
 		// at this point, tx is already closed, so no need to rollback
 		return 0, err
 	}
+
+	// this is to avoid leaks in worst case scenario
+	defer conn.Release()
 
 	if rowsAffected == 0 && !opts.AllowNone {
 		return 0, &RowNotFoundError{}
@@ -1500,16 +1503,19 @@ func (db *DBWrapper) Update(value any, table Table, opts QueryOpts) (int, error)
 
 	if opts.Limit != 0 && rowsAffected > opts.Limit {
 		tx.Rollback(*db.context)
-		tx.Conn().Close(*db.context)
 		return 0, &ExceededLimitError{RowCount: rowsAffected, Limit: opts.Limit}
 	}
 
+	// commit changes
 	err = tx.Commit(*db.context)
 	if err != nil {
 		tx.Rollback(*db.context)
-		tx.Conn().Close(*db.context)
 		return 0, ConnectionErr
 	}
+
+	// close connection
+	conn.Release()
+
 	return rowsAffected, nil
 }
 
@@ -1532,7 +1538,7 @@ func (db *DBWrapper) Delete(table Table, opts QueryOpts) (int, error) {
 	if err != nil {
 		return 0, ConnectionErr
 	}
-	defer conn.Conn().Close(*db.context)
+	defer conn.Release()
 
 	// begin transaction
 	tx, err := conn.Begin(*db.context)
@@ -1544,7 +1550,6 @@ func (db *DBWrapper) Delete(table Table, opts QueryOpts) (int, error) {
 	cmdTag, err := tx.Exec(*db.context, sql, opts.Filters.Args()...)
 	if err != nil {
 		tx.Rollback(*db.context)
-		tx.Conn().Close(*db.context)
 		return 0, err
 	}
 
@@ -1555,7 +1560,6 @@ func (db *DBWrapper) Delete(table Table, opts QueryOpts) (int, error) {
 
 	if opts.Limit != 0 && int(cmdTag.RowsAffected()) > opts.Limit {
 		tx.Rollback(*db.context)
-		tx.Conn().Close(*db.context)
 		return 0, &ExceededLimitError{
 			RowCount: int(cmdTag.RowsAffected()),
 			Limit: opts.Limit,
@@ -1566,11 +1570,11 @@ func (db *DBWrapper) Delete(table Table, opts QueryOpts) (int, error) {
 	err = tx.Commit(*db.context)
 	if err != nil {
 		tx.Rollback(*db.context)
-		tx.Conn().Close(*db.context)
 		return 0, ConnectionErr
 	}
 
-	tx.Conn().Close(*db.context)
+	// close connection
+	conn.Release()
 
 	// return number of rows affected
 	return int(cmdTag.RowsAffected()), nil
@@ -1598,7 +1602,7 @@ func (db *DBWrapper) QuerySql(values any, sql string, parameters ...any) (int, e
 	if err != nil {
 		return 0, ConnectionErr
 	}
-	defer conn.Conn().Close(*db.context)
+	defer conn.Release()
 
 	// make query
 	rows, err := conn.Query(*db.context, sql, parameters...)
@@ -1672,7 +1676,7 @@ func (db *DBWrapper) ExecuteSql(sql string, parameters ...any) (int, error) {
 	if err != nil {
 		return 0, ConnectionErr
 	}
-	defer conn.Conn().Close(*db.context)
+	defer conn.Release()
 
 	// execute sql
 	tag, err := conn.Exec(*db.context, sql, parameters...)
