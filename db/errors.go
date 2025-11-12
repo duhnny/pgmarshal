@@ -111,3 +111,29 @@ type SyntaxError struct {
 func (err SyntaxError) Error() string {
 	return err.Message
 }
+
+type SqlError struct {
+	Sql  string
+	Args []any
+	Err  error
+}
+
+func (err SqlError) Error() string {
+	message := fmt.Sprintf(
+		"db: failed to run the following sql: `%s` with args: [%s] with the following error: %s",
+		err.Sql,
+		strings.Join(
+			utils.Map(err.Args, func(arg any) string {
+				return fmt.Sprintf("%+v", arg)
+			}),
+			", ",
+		),
+		err.Err.Error(),
+	)
+
+	return message
+}
+
+func (err SqlError) Unwrap() error {
+	return err.Err
+}

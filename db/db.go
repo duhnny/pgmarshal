@@ -427,7 +427,11 @@ func (db *DBWrapper) Create(values any, table Table, opts QueryOpts) (int, error
 		ctag, err := tx.Exec(*db.context, sql, args...)
 		if err != nil {
 			tx.Rollback(*db.context)
-			return 0, err
+			return 0, SqlError{
+				Sql: sql,
+				Args: args,
+				Err: err,
+			}
 		}
 
 		rowsAffected += int(ctag.RowsAffected())
@@ -628,7 +632,11 @@ func (db *DBWrapper) Query(values any, table Table, opts QueryOpts) (int, error)
     // actually query db
     rows, err := conn.Query(*db.context, finalSql, finalArgs...)
     if err != nil {
-		return 0, fmt.Errorf("db: could not send query: %w", err)
+		return 0, SqlError{
+			Sql: finalSql,
+			Args: finalArgs,
+			Err: err,
+		}
     }
 
     i := 0
@@ -1470,7 +1478,11 @@ func (db *DBWrapper) updateInternal(value any, table Table, opts QueryOpts) (int
 		if err != nil {
 			tx.Rollback(*db.context)
 			conn.Release()
-			return 0, nil, nil, err
+			return 0, nil, nil, SqlError{
+				Sql: statement.sql,
+				Args: statement.args,
+				Err: err,
+			}
 		}
 
 		rowsAffected += int(cmdTag.RowsAffected())
@@ -1552,7 +1564,11 @@ func (db *DBWrapper) Delete(table Table, opts QueryOpts) (int, error) {
 	cmdTag, err := tx.Exec(*db.context, sql, opts.Filters.Args()...)
 	if err != nil {
 		tx.Rollback(*db.context)
-		return 0, err
+		return 0, SqlError{
+			Sql: sql,
+			Args: opts.Filters.Args(),
+			Err: err,
+		}
 	}
 
 	// perform checks and rollback if needed
@@ -1609,7 +1625,11 @@ func (db *DBWrapper) QuerySql(values any, sql string, parameters ...any) (int, e
 	// make query
 	rows, err := conn.Query(*db.context, sql, parameters...)
 	if err != nil {
-		return 0, fmt.Errorf("db: %w", err)
+		return 0, SqlError{
+			Sql: sql,
+			Args: parameters,
+			Err: err,
+		}
 	}
 	defer rows.Close()
 
@@ -1683,7 +1703,11 @@ func (db *DBWrapper) ExecuteSql(sql string, parameters ...any) (int, error) {
 	// execute sql
 	tag, err := conn.Exec(*db.context, sql, parameters...)
 	if err != nil {
-		return 0, fmt.Errorf("db: %w", err)
+		return 0, SqlError{
+			Sql: sql,
+			Args: parameters,
+			Err: err,
+		}
 	}
 
 	return int(tag.RowsAffected()), nil
