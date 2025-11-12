@@ -243,9 +243,10 @@ func (ins insert) write() (string, []any, error) {
 				placeholders = append(placeholders, fmt.Sprintf("$%d", i+1))
 			}
 
-			return "(" + strings.Join(placeholders, ", ") + ")\n"
+			return "(" + strings.Join(placeholders, ", ") + ")"
 		}),
 		ins.values,
+		",\n",
 	)
 
 	return sql + valuesSql + ";", args, nil
@@ -612,6 +613,7 @@ func (db *DBWrapper) Query(values any, table Table, opts QueryOpts) (int, error)
 			{},
             limitArgs,
         },
+		" ",
     )
 
     finalSql += ";"

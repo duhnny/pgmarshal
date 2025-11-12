@@ -101,3 +101,13 @@ func (err InvalidMarshalOptsError) Error() string {
 
 	return fmt.Sprintf("db: invalid value for option %s: %s", err.Opt, err.Value)
 }
+
+type SyntaxError struct {
+	Sql     string
+	Args    []any
+	Message string
+}
+
+func (err SyntaxError) Error() string {
+	return err.Message
+}

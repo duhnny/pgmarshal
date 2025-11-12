@@ -130,17 +130,23 @@ func ShiftArgs(sql string, n int) string {
 	return string(newSqlb)
 }
 
-func JoinSql(sql []string, args [][]any) (string, []any) {
+func JoinSql(sql []string, args [][]any, sep string) (string, []any) {
     if (len(sql) != len(args)) {
         panic(fmt.Errorf("sql lines and slice of args should have the same length"))
     }
 
     newSql := ""
     newArgs := make([]any, 0)
-    for i := 0; i < len(sql); i++ {
-        newSql += ShiftArgs(sql[i], len(newArgs)) + " "
+    for i := 0; i < len(sql)-1; i++ {
+        newSql += ShiftArgs(sql[i], len(newArgs)) + sep
         newArgs = append(newArgs, args[i]...)
     }
+
+	// last item
+	if len(sql) > 0 {
+		newSql += ShiftArgs(sql[len(sql)-1], len(newArgs))
+		newArgs = append(newArgs, args[len(args)-1]...)
+	}
 
     return newSql, newArgs
 }
