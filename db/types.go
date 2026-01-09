@@ -55,7 +55,9 @@ const (
 	Eq  operator = iota // represents "=" in sql statements
 	Neq                 // represents "<>" in sql statements
 	Gt                  // represents ">" in sql statements
+	Gte                 // represents ">=" in sql statements
 	Lt                  // represents "<" in sql statements
+	Lte                 // represents "<=" in sql statements
 	In                  // represents "IN" in sql statements
 	Any                 // represents "= ANY " in sql statements
 )
@@ -68,8 +70,12 @@ func (op *operator) write() string {
 		return "<>"
 	case Gt:
 		return ">"
+	case Gte:
+		return ">="
 	case Lt:
 		return "<"
+	case Lte:
+		return "<="
 	case In:
 		return "IN"
 	case Any:
