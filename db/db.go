@@ -8,9 +8,9 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/danielbetoret/organization/services/api/src/myerrors"
-	"github.com/danielbetoret/organization/services/api/src/reflection"
-	"github.com/danielbetoret/organization/services/api/src/utils"
+	"github.com/duhnny/pgmarshal/myerrors"
+	"github.com/duhnny/pgmarshal/reflection"
+	"github.com/duhnny/pgmarshal/utils"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )

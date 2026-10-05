@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/danielbetoret/organization/services/api/src/reflection"
+	"github.com/duhnny/pgmarshal/reflection"
 )
 
 type MockDB struct {

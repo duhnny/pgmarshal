@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/danielbetoret/organization/services/api/src/utils"
+	"github.com/duhnny/pgmarshal/utils"
 )
 
 func TestNewOptional(t *testing.T) {

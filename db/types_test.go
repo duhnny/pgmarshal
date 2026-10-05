@@ -3,7 +3,7 @@ package db
 import (
 	"testing"
 
-	"github.com/danielbetoret/organization/services/api/src/reflection"
+	"github.com/duhnny/pgmarshal/reflection"
 )
 
 func TestMarshaler(t *testing.T) {

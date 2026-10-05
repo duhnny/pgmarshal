@@ -5,8 +5,8 @@ import (
 	"reflect"
 	"slices"
 
-	"github.com/danielbetoret/organization/services/api/src/reflection"
-	"github.com/danielbetoret/organization/services/api/src/utils"
+	"github.com/duhnny/pgmarshal/reflection"
+	"github.com/duhnny/pgmarshal/utils"
 )
 
 type DBType uint

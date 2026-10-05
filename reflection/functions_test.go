@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/danielbetoret/organization/services/api/src/utils"
+	"github.com/duhnny/pgmarshal/utils"
 )
 
 func TestDeepEqual(t *testing.T) {

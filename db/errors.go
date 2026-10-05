@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/danielbetoret/organization/services/api/src/utils"
+	"github.com/duhnny/pgmarshal/utils"
 )
 
 type RowNotFoundError struct {
