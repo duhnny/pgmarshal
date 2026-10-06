@@ -49,6 +49,7 @@ func TestStructMap(t *testing.T) {
 		typ,
 		reflection.NewPath(""),
 		&structMap,
+		DbMarshalOpts{},
 		QueryOpts{ AllFields: true },
 	)
 	if err != nil {
@@ -77,16 +78,4 @@ func TestStructMap(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed to gather query data")
 	}
-
-	// structMap.Print()
-	// for column, path := range columnMap {
-	// 	fmt.Printf(
-	// 		"%s.%s.%s: %s\n",
-	// 		column.Table.Schema,
-	// 		column.Table.Name,
-	// 		column.Name,
-	// 		strings.Join(*path, "."),
-	// 	)
-	// }
-	// t.Errorf("it's actually nothing")
 }

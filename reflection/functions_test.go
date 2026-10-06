@@ -68,7 +68,7 @@ func TestGetDeepFields(t *testing.T) {
 		return
 	}
 
-	if f1[0].Name != "A" || f1[1].Name != "B" {
+	if f1[".A"].Name != "A" || f1[".B"].Name != "B" {
 		t.Errorf("GetDeepFields is not getting fields properly for basic structs")
 	}
 
@@ -82,8 +82,8 @@ func TestGetDeepFields(t *testing.T) {
 		t.Errorf("GetDeepFields is not getting all fields for embedded structs")
 		return
 	}
-	
-	if f2[0].Name != "A" || f2[1].Name != "B" || f2[2].Name != "C" {
+
+	if f2[".s1.A"].Name != "A" || f2[".s1.B"].Name != "B" || f2[".C"].Name != "C" {
 		t.Errorf("GetDeepFields is not getting fields properly for embedded structs")
 	}
 }
